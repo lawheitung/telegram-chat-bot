@@ -1,0 +1,25 @@
+name = "telegram-claude-bot"
+main = "src/index.ts"
+compatibility_date = "2025-06-01"
+
+# Non-secret config (secrets go via `wrangler secret put`, see README)
+[vars]
+ALLOWED_USER_IDS = "8439199295"
+
+# State (conversation history, per-topic area, soul/agents/memory docs) lives in the
+# AgentDO's SQLite storage — see the durable_objects binding below. No KV needed.
+
+# Free plan: no Queue. The slow LLM call runs in ctx.waitUntil after we ack Telegram.
+
+# Workers AI — free models, no key. Enables the "cheap" area (env.AI binding).
+[ai]
+binding = "AI"
+
+# Durable Object: the stateful agent. SQLite-backed (required + free on the Free plan).
+[[durable_objects.bindings]]
+name = "AGENT"
+class_name = "AgentDO"
+ 
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["AgentDO"]
