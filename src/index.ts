@@ -1,6 +1,7 @@
 import type { Env } from "./types";
 import { makeBot, sessionKey, sendPlaceholder, sendText } from "./bot";
 import { AREAS, DEFAULT_AREA, areaList } from "./router";
+import { miniAppHtml, handleMiniAppApi, encodeSession } from "./miniapp";
 
 // The Durable Object class must be exported from the entry module so the runtime
 // can find it (matches class_name in wrangler.toml).
@@ -8,6 +9,17 @@ export { AgentDO } from "./agent";
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const url = new URL(request.url);
+
+    // ---- Mini app: serve HTML and API ----
+    if (request.method === "GET" && url.pathname === "/") {
+      return new Response(miniAppHtml(), { headers: { "Content-Type": "text/html;charset=UTF-8" } });
+    }
+    if (url.pathname === "/api/docs") {
+      const stub = env.AGENT.get(env.AGENT.idFromName("default"));
+      return handleMiniAppApi(request, env, stub);
+    }
+
     if (request.method !== "POST") return new Response("ok"); // health check
 
     if (request.headers.get("X-Telegram-Bot-Api-Secret-Token") !== env.WEBHOOK_SECRET) {
@@ -117,6 +129,19 @@ export default {
       if (cmd === "/forget") {
         await stub.clearDoc("memory", key);
         await sendText(bot, chatId, "Cleared all saved memory.", threadId);
+        return new Response("ok");
+      }
+
+      if (cmd === "/edit") {
+        const workerUrl = new URL(request.url).origin;
+        const startParam = encodeSession(key);
+        const miniAppUrl = `${workerUrl}?startapp=${startParam}`;
+        await bot.api.sendMessage(chatId, "Open the editor to update soul, agents and memory:", {
+          ...(threadId ? { message_thread_id: threadId } : {}),
+          reply_markup: {
+            inline_keyboard: [[{ text: "✏️ Open Editor", web_app: { url: miniAppUrl } }]],
+          },
+        });
         return new Response("ok");
       }
       // Unknown command: fall through and treat as a normal message.
