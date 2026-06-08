@@ -173,7 +173,7 @@ export function miniAppHtml(): string {
   }
   button.save:disabled { opacity: 0.5; cursor: not-allowed; }
   .status { font-size: 13px; text-align: center; min-height: 18px; }
-  .status.ok { color: #4caf50; }
+  .status.ok { color: #FE5F55; }
   .status.err { color: #f44336; }
 </style>
 </head>
