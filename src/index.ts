@@ -33,6 +33,7 @@ export default {
 
     const text = (msg.text ?? msg.caption ?? "").trim();
     const photo = msg.photo?.[msg.photo.length - 1]; // largest rendition
+    const document = msg.document;
 
     // ---- Commands (fast, handled in the Worker — no model call) ----
     if (text.startsWith("/")) {
@@ -121,7 +122,7 @@ export default {
       // Unknown command: fall through and treat as a normal message.
     }
 
-    if (!text && !photo) return new Response("ok");
+    if (!text && !photo && !document) return new Response("ok");
 
     // ---- Normal message: ack FAST, hand the slow work to the agent DO ----
     const placeholder = await sendPlaceholder(bot, chatId, threadId);
@@ -133,6 +134,9 @@ export default {
         sessionKey: key,
         text,
         photoFileId: photo?.file_id,
+        documentFileId: document?.file_id,
+        documentMimeType: document?.mime_type,
+        documentFileName: document?.file_name,
       }),
     );
 
@@ -146,6 +150,7 @@ interface TgUpdate {
     text?: string;
     caption?: string;
     photo?: { file_id: string }[];
+    document?: { file_id: string; mime_type?: string; file_name?: string; file_size?: number };
     chat: { id: number };
     from?: { id: number };
     message_thread_id?: number;

@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env, ChatMessage } from "./types";
-import { makeBot, downloadImageB64, sendReply, buildSystem, MAX_TURNS } from "./bot";
+import { makeBot, downloadImageB64, downloadFileText, isTextMime, isImageMime, sendReply, buildSystem, MAX_TURNS } from "./bot";
 import { AREAS, DEFAULT_AREA, resolveTarget } from "./router";
 import { generate } from "./providers";
 
@@ -12,6 +12,9 @@ export interface HandlePayload {
   sessionKey: string;
   text: string;
   photoFileId?: string;
+  documentFileId?: string;
+  documentMimeType?: string;
+  documentFileName?: string;
 }
 
 // The three editable "files" the system prompt is built from: soul (identity),
@@ -93,14 +96,40 @@ export class AgentDO extends DurableObject<Env> {
     const env = this.env;
     const bot = makeBot(env.BOT_TOKEN);
     try {
-      // Pick the area: explicit selection wins; an image with no selection -> "image".
-      let areaId = (await this.getArea(p.sessionKey)) ?? (p.photoFileId ? "image" : DEFAULT_AREA);
+      // Pick the area: explicit selection wins; any image (photo or image document) -> "image".
+      const hasImage = !!p.photoFileId || !!(p.documentFileId && p.documentMimeType && isImageMime(p.documentMimeType));
+      let areaId = (await this.getArea(p.sessionKey)) ?? (hasImage ? "image" : DEFAULT_AREA);
       if (!AREAS[areaId]) areaId = DEFAULT_AREA;
       const area = AREAS[areaId];
 
-      const image = p.photoFileId
+      const photoImage = p.photoFileId
         ? await downloadImageB64(bot, env.BOT_TOKEN, p.photoFileId)
         : undefined;
+
+      let userText = p.text;
+      let historyLabel = p.text || "(image)";
+      let docImage: { mimeType: string; dataB64: string } | undefined;
+
+      if (p.documentFileId) {
+        if (p.documentMimeType && isImageMime(p.documentMimeType)) {
+          docImage = await downloadImageB64(bot, env.BOT_TOKEN, p.documentFileId);
+          historyLabel = p.text || `(image: ${p.documentFileName ?? p.documentMimeType})`;
+        } else if (p.documentMimeType && isTextMime(p.documentMimeType)) {
+          const fileContent = await downloadFileText(bot, env.BOT_TOKEN, p.documentFileId);
+          const header = p.documentFileName ? `[File: ${p.documentFileName}]\n` : "[File]\n";
+          userText = userText
+            ? `${userText}\n\n${header}\`\`\`\n${fileContent}\n\`\`\``
+            : `${header}\`\`\`\n${fileContent}\n\`\`\``;
+          historyLabel = p.text || `(file: ${p.documentFileName ?? p.documentMimeType})`;
+        } else {
+          userText = userText
+            ? `${userText}\n\n[Unsupported file type: ${p.documentMimeType ?? "unknown"} — only text-based files and images can be read]`
+            : `[Unsupported file type: ${p.documentMimeType ?? "unknown"} — only text-based files and images can be read]`;
+          historyLabel = p.text || "(unsupported file)";
+        }
+      }
+
+      const image = photoImage ?? docImage;
       const target = resolveTarget(area, !!image);
       const history = await this.getHistory(p.sessionKey);
       const [soul, agents, memory] = await Promise.all([
@@ -114,14 +143,14 @@ export class AgentDO extends DurableObject<Env> {
           system: buildSystem(area.system, { soul, agents, memory }),
           target,
           history,
-          userText: p.text,
+          userText,
           image,
         },
         env,
       );
 
       await sendReply(bot, p.chatId, p.placeholderId, reply, p.threadId);
-      await this.saveTurn(p.sessionKey, p.text || "(image)", reply);
+      await this.saveTurn(p.sessionKey, historyLabel, reply);
     } catch (err) {
       console.error("agent handleMessage failed", err);
       await sendReply(
