@@ -202,8 +202,9 @@ export default {
           } else {
             const lines = await Promise.all(agents.map(async (a) => {
               const area = (await stub.getArea(`agent:${a.name}`)) ?? "default";
+              const tgId = String(Math.abs(a.chatId ?? 0)).replace(/^100/, "");
               const link = (a.chatId && a.threadId)
-                ? ` — t.me/c/${Math.abs(a.chatId)}/${a.threadId}`
+                ? ` — t.me/c/${tgId}/${a.threadId}`
                 : "";
               return `• ${a.name} [${area}]${link}`;
             }));
