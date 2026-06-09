@@ -94,14 +94,20 @@ export async function handleMiniAppApi(
   const sessionParam = url.searchParams.get("session") ?? "";
   const sessionKey = sessionParam ? decodeSession(sessionParam) : undefined;
 
-  // GET /api/docs — load all three docs for the session
+  const ALL_DOCS = ["soul", "user", "agents", "tools", "memory", "heartbeat", "local_tools"] as const;
+
+  // GET /api/docs — load all docs for the session
   if (request.method === "GET") {
-    const [soul, agents, memory] = await Promise.all([
+    const [soul, user, tools, agents, memory, heartbeat, local_tools] = await Promise.all([
       stub.loadDoc("soul"),
+      stub.loadDoc("user"),
+      stub.loadDoc("tools"),
       stub.loadDoc("agents", sessionKey),
       stub.loadDoc("memory", sessionKey),
+      stub.loadDoc("heartbeat", sessionKey),
+      stub.loadDoc("local_tools", sessionKey),
     ]);
-    return new Response(JSON.stringify({ soul, agents, memory }), {
+    return new Response(JSON.stringify({ soul, user, tools, agents, memory, heartbeat, local_tools }), {
       headers: { ...cors, "Content-Type": "application/json" },
     });
   }
@@ -109,13 +115,13 @@ export async function handleMiniAppApi(
   // POST /api/docs — save one doc
   if (request.method === "POST") {
     const { name, content } = (await request.json()) as { name: string; content: string };
-    if (!["soul", "agents", "memory"].includes(name)) {
+    if (!(ALL_DOCS as readonly string[]).includes(name)) {
       return new Response(JSON.stringify({ error: "invalid doc name" }), {
         status: 400,
         headers: { ...cors, "Content-Type": "application/json" },
       });
     }
-    await stub.saveDoc(name as "soul" | "agents" | "memory", content, sessionKey);
+    await stub.saveDoc(name as typeof ALL_DOCS[number], content, sessionKey);
     return new Response(JSON.stringify({ ok: true }), {
       headers: { ...cors, "Content-Type": "application/json" },
     });
@@ -141,15 +147,17 @@ export function miniAppHtml(): string {
     background: var(--tg-theme-bg-color, #fff);
     color: var(--tg-theme-text-color, #000);
     min-height: 100vh;
-    padding: 16px;
+    padding: 12px 16px 24px;
   }
-  h1 { font-size: 18px; font-weight: 600; margin-bottom: 16px; }
-  .tabs { display: flex; gap: 8px; margin-bottom: 16px; }
+  h1 { font-size: 17px; font-weight: 600; margin-bottom: 12px; }
+  .tabs {
+    display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px;
+  }
   .tab {
-    flex: 1; padding: 8px; border-radius: 8px; border: none; cursor: pointer;
+    padding: 6px 12px; border-radius: 20px; border: none; cursor: pointer;
     background: var(--tg-theme-secondary-bg-color, #f0f0f0);
     color: var(--tg-theme-text-color, #000);
-    font-size: 14px; font-weight: 500;
+    font-size: 13px; font-weight: 500;
   }
   .tab.active {
     background: var(--tg-theme-button-color, #2481cc);
@@ -157,16 +165,20 @@ export function miniAppHtml(): string {
   }
   .panel { display: none; }
   .panel.active { display: flex; flex-direction: column; gap: 10px; }
-  label { font-size: 13px; opacity: 0.7; }
+  .desc { font-size: 12px; opacity: 0.6; line-height: 1.4; }
+  .badge {
+    display: inline-block; font-size: 10px; padding: 1px 6px; border-radius: 8px;
+    background: var(--tg-theme-secondary-bg-color, #eee);
+    opacity: 0.7; margin-left: 4px; vertical-align: middle;
+  }
   textarea {
-    width: 100%; min-height: 200px; padding: 12px; border-radius: 10px; border: none;
+    width: 100%; min-height: 180px; padding: 12px; border-radius: 10px; border: none;
     background: var(--tg-theme-secondary-bg-color, #f0f0f0);
     color: var(--tg-theme-text-color, #000);
-    font-size: 14px; line-height: 1.5; resize: vertical;
-    outline: none;
+    font-size: 14px; line-height: 1.5; resize: vertical; outline: none;
   }
   button.save {
-    padding: 12px; border-radius: 10px; border: none; cursor: pointer;
+    padding: 11px; border-radius: 10px; border: none; cursor: pointer;
     background: var(--tg-theme-button-color, #2481cc);
     color: var(--tg-theme-button-text-color, #fff);
     font-size: 15px; font-weight: 600;
@@ -179,30 +191,8 @@ export function miniAppHtml(): string {
 </head>
 <body>
 <h1>Bot Settings</h1>
-<div class="tabs">
-  <button class="tab active" onclick="switchTab('soul')">Soul</button>
-  <button class="tab" onclick="switchTab('agents')">Agents</button>
-  <button class="tab" onclick="switchTab('memory')">Memory</button>
-</div>
-
-<div id="panel-soul" class="panel active">
-  <label>Identity — who the bot is (global, all chats)</label>
-  <textarea id="ta-soul" placeholder="e.g. You are a concise assistant…"></textarea>
-  <button class="save" onclick="save('soul')">Save Soul</button>
-  <div class="status" id="st-soul"></div>
-</div>
-<div id="panel-agents" class="panel">
-  <label>Behaviour rules — how the bot acts in this chat</label>
-  <textarea id="ta-agents" placeholder="e.g. Always reply in bullet points…"></textarea>
-  <button class="save" onclick="save('agents')">Save Agents</button>
-  <div class="status" id="st-agents"></div>
-</div>
-<div id="panel-memory" class="panel">
-  <label>Persistent memory — facts about you in this chat</label>
-  <textarea id="ta-memory" placeholder="e.g. - prefers metric units…"></textarea>
-  <button class="save" onclick="save('memory')">Save Memory</button>
-  <div class="status" id="st-memory"></div>
-</div>
+<div class="tabs" id="tab-bar"></div>
+<div id="panels"></div>
 
 <script>
 const tg = window.Telegram.WebApp;
@@ -210,8 +200,47 @@ tg.ready();
 tg.expand();
 
 const initData = tg.initData;
-const session  = tg.initDataUnsafe?.start_param ?? "";
-const base     = location.origin + "/api/docs" + (session ? "?session=" + session : "");
+// Fix: web_app keyboard buttons don't set start_param via SDK — read from URL query string
+const urlParams = new URLSearchParams(location.search);
+const session = tg.initDataUnsafe?.start_param || urlParams.get("startapp") || "";
+
+// Show agent name in header if this session is a named agent
+const decodedSession = session.replace(/-C-/g, ":").replace(/N(\d)/g, "-$1");
+const agentName = decodedSession.startsWith("agent:") ? decodedSession.slice(6) : null;
+if (agentName) document.querySelector("h1").textContent = "Agent: " + agentName;
+const base = location.origin + "/api/docs" + (session ? "?session=" + encodeURIComponent(session) : "");
+
+const DOCS = [
+  { name: "soul",        label: "Soul",        scope: "global", desc: "Core identity and personality — applies to all chats" },
+  { name: "user",        label: "User",        scope: "global", desc: "Your profile, preferences and facts about you — applies to all chats" },
+  { name: "tools",       label: "Tools",       scope: "global", desc: "Global tools and capabilities available in all chats" },
+  { name: "agents",      label: "Agents",      scope: "thread", desc: "Specialised agent behaviour for this thread specifically" },
+  { name: "local_tools", label: "Local Tools", scope: "thread", desc: "Extra tools or overrides specific to this thread only" },
+  { name: "heartbeat",   label: "Heartbeat",   scope: "thread", desc: "Recurring context or periodic instructions for this thread" },
+  { name: "memory",      label: "Memory",      scope: "thread", desc: "Persistent facts the bot remembers in this thread" },
+];
+
+// Build tabs and panels
+const tabBar  = document.getElementById("tab-bar");
+const panels  = document.getElementById("panels");
+DOCS.forEach((d, i) => {
+  const tab = document.createElement("button");
+  tab.className = "tab" + (i === 0 ? " active" : "");
+  tab.textContent = d.label;
+  tab.onclick = () => switchTab(d.name);
+  tabBar.appendChild(tab);
+
+  const panel = document.createElement("div");
+  panel.id = "panel-" + d.name;
+  panel.className = "panel" + (i === 0 ? " active" : "");
+  panel.innerHTML = \`
+    <p class="desc">\${d.desc} <span class="badge" style="\${d.scope==='global'?'background:#FE5F55;color:#fff;opacity:1':''}">\${d.scope}</span></p>
+    <textarea id="ta-\${d.name}" placeholder="Leave blank to disable…"></textarea>
+    <button class="save" onclick="save('\${d.name}')">Save \${d.label}</button>
+    <div class="status" id="st-\${d.name}"></div>
+  \`;
+  panels.appendChild(panel);
+});
 
 async function apiFetch(method, body) {
   const res = await fetch(base, {
@@ -226,9 +255,9 @@ async function apiFetch(method, body) {
 async function load() {
   try {
     const data = await apiFetch("GET");
-    document.getElementById("ta-soul").value    = data.soul    ?? "";
-    document.getElementById("ta-agents").value  = data.agents  ?? "";
-    document.getElementById("ta-memory").value  = data.memory  ?? "";
+    DOCS.forEach(d => {
+      document.getElementById("ta-" + d.name).value = data[d.name] ?? "";
+    });
   } catch (e) {
     setStatus("soul", "Failed to load: " + e.message, true);
   }
@@ -257,8 +286,7 @@ function setStatus(name, msg, isErr) {
 
 function switchTab(name) {
   document.querySelectorAll(".tab").forEach((t, i) => {
-    const names = ["soul", "agents", "memory"];
-    t.classList.toggle("active", names[i] === name);
+    t.classList.toggle("active", DOCS[i].name === name);
   });
   document.querySelectorAll(".panel").forEach(p => p.classList.remove("active"));
   document.getElementById("panel-" + name).classList.add("active");

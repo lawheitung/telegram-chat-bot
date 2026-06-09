@@ -17,10 +17,10 @@ export interface HandlePayload {
   documentFileName?: string;
 }
 
-// The three editable "files" the system prompt is built from: soul (identity),
-// agents (rules), memory (facts). soul is global; agents and memory are per-thread
-// so each topic can be a distinct agent with its own rules and remembered facts.
-export type DocName = "soul" | "agents" | "memory";
+// Editable docs that make up the system prompt.
+// Global: soul, user, tools
+// Per-thread: agents, memory, heartbeat, local_tools
+export type DocName = "soul" | "user" | "agents" | "tools" | "memory" | "heartbeat" | "local_tools";
 
 // The stateful agent. A single "default" instance handles every message, and ALL
 // state — conversation history, per-conversation area, and the soul/agents/memory
@@ -59,7 +59,7 @@ export class AgentDO extends DurableObject<Env> {
   // ----------------------------- editable docs -----------------------------
   // soul is global; agents and memory are scoped per thread via sessionKey.
   private docKey(name: DocName, sessionKey?: string): string {
-    if (name === "soul") return "doc:soul";
+    if (name === "soul" || name === "user" || name === "tools") return `doc:${name}`;
     return `doc:${name}:${sessionKey ?? "global"}`;
   }
 
@@ -67,7 +67,7 @@ export class AgentDO extends DurableObject<Env> {
     const scoped = await this.ctx.storage.get<string>(this.docKey(name, sessionKey));
     if (scoped !== undefined) return scoped;
     // One-time migration: if an old global key exists, promote it to the scoped key.
-    if (name !== "soul" && sessionKey) {
+    if (name !== "soul" && name !== "user" && name !== "tools" && sessionKey) {
       const legacy = await this.ctx.storage.get<string>(`doc:${name}`);
       if (legacy) {
         await this.ctx.storage.put(this.docKey(name, sessionKey), legacy);
@@ -89,6 +89,33 @@ export class AgentDO extends DurableObject<Env> {
 
   async clearDoc(name: DocName, sessionKey?: string): Promise<void> {
     await this.ctx.storage.delete(this.docKey(name, sessionKey));
+  }
+
+  // ----------------------------- named agents -----------------------------
+  async setAgentName(threadKey: string, name: string): Promise<void> {
+    await this.ctx.storage.put(`agent:name:${threadKey}`, name);
+  }
+
+  async getAgentName(threadKey: string): Promise<string | null> {
+    return (await this.ctx.storage.get<string>(`agent:name:${threadKey}`)) ?? null;
+  }
+
+  async clearAgentName(threadKey: string): Promise<void> {
+    await this.ctx.storage.delete(`agent:name:${threadKey}`);
+  }
+
+  async listAgents(): Promise<Array<{ name: string; threadKey: string }>> {
+    const map = await this.ctx.storage.list<string>({ prefix: "agent:name:" });
+    const result: Array<{ name: string; threadKey: string }> = [];
+    for (const [k, v] of map) {
+      result.push({ threadKey: k.slice("agent:name:".length), name: v });
+    }
+    return result;
+  }
+
+  async resolveSessionKey(threadKey: string): Promise<string> {
+    const name = await this.getAgentName(threadKey);
+    return name ? `agent:${name}` : threadKey;
   }
 
   // ----------------------------- the message handler -----------------------------
@@ -132,15 +159,19 @@ export class AgentDO extends DurableObject<Env> {
       const image = photoImage ?? docImage;
       const target = resolveTarget(area, !!image);
       const history = await this.getHistory(p.sessionKey);
-      const [soul, agents, memory] = await Promise.all([
+      const [soul, user, tools, agents, memory, heartbeat, local_tools] = await Promise.all([
         this.loadDoc("soul"),
+        this.loadDoc("user"),
+        this.loadDoc("tools"),
         this.loadDoc("agents", p.sessionKey),
         this.loadDoc("memory", p.sessionKey),
+        this.loadDoc("heartbeat", p.sessionKey),
+        this.loadDoc("local_tools", p.sessionKey),
       ]);
 
       const reply = await generate(
         {
-          system: buildSystem(area.system, { soul, agents, memory }),
+          system: buildSystem(area.system, { soul, user, agents, tools, memory, heartbeat, local_tools }),
           target,
           history,
           userText,

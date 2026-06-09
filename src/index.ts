@@ -13,7 +13,12 @@ export default {
 
     // ---- Mini app: serve HTML and API ----
     if (request.method === "GET" && url.pathname === "/") {
-      return new Response(miniAppHtml(), { headers: { "Content-Type": "text/html;charset=UTF-8" } });
+      return new Response(miniAppHtml(), {
+        headers: {
+          "Content-Type": "text/html;charset=UTF-8",
+          "Cache-Control": "no-cache, no-store, must-revalidate",
+        },
+      });
     }
     if (url.pathname === "/api/docs") {
       const stub = env.AGENT.get(env.AGENT.idFromName("default"));
@@ -43,6 +48,10 @@ export default {
     // own SQLite storage. Commands below read/write that state via RPC on this stub.
     const stub = env.AGENT.get(env.AGENT.idFromName("default"));
 
+    // If this thread has a named agent, use agent:{name} as the effective session key.
+    // This means all docs/area/history are stored under the agent name, surviving thread deletion.
+    const effectiveKey = await stub.resolveSessionKey(key);
+
     const text = (msg.text ?? msg.caption ?? "").trim();
     const photo = msg.photo?.[msg.photo.length - 1]; // largest rendition
     const document = msg.document;
@@ -52,14 +61,17 @@ export default {
       const [cmd, arg] = text.split(/\s+/, 2);
 
       if (cmd === "/start" || cmd === "/help") {
-        const current = (await stub.getArea(key)) ?? DEFAULT_AREA;
+        const current = (await stub.getArea(effectiveKey)) ?? DEFAULT_AREA;
+        const agentName = await stub.getAgentName(key);
         await sendText(
           bot,
           chatId,
           `Hi! Each conversation uses model(s) based on its area.\n\n` +
+            (agentName ? `Agent: ${agentName}\n` : "") +
             `Current area: ${current}\n\nSet it with /model <area>:\n${areaList()}\n\n` +
             `Identity: /soul, /agents (view, or set by adding text).\n` +
             `Memory: /remember <fact>, /memory (view), /forget (clear).\n` +
+            `/agent set <name> — assign a named agent to this thread.\n` +
             `/reset clears this conversation's history.`,
           threadId,
         );
@@ -67,17 +79,17 @@ export default {
       }
 
       if (cmd === "/reset") {
-        await stub.clearHistory(key);
+        await stub.clearHistory(effectiveKey);
         await sendText(bot, chatId, "Conversation cleared.", threadId);
         return new Response("ok");
       }
 
       if (cmd === "/model") {
-        const current = (await stub.getArea(key)) ?? DEFAULT_AREA;
+        const current = (await stub.getArea(effectiveKey)) ?? DEFAULT_AREA;
         if (!arg || !AREAS[arg]) {
           await sendText(bot, chatId, `Current area: ${current}\n\nChoose one:\n${areaList()}`, threadId);
         } else {
-          await stub.setArea(key, arg);
+          await stub.setArea(effectiveKey, arg);
           await sendText(bot, chatId, `Area set to ${arg} — ${AREAS[arg].label}.`, threadId);
         }
         return new Response("ok");
@@ -87,7 +99,7 @@ export default {
         const name = cmd === "/soul" ? "soul" : "agents";
         const body = text.slice(cmd.length).trim();
         if (!body) {
-          const cur = (await stub.loadDoc(name, key)).trim();
+          const cur = (await stub.loadDoc(name, effectiveKey)).trim();
           await sendText(
             bot,
             chatId,
@@ -95,10 +107,10 @@ export default {
             threadId,
           );
         } else if (body === "clear") {
-          await stub.clearDoc(name, key);
+          await stub.clearDoc(name, effectiveKey);
           await sendText(bot, chatId, `${cmd} cleared.`, threadId);
         } else {
-          await stub.saveDoc(name, body, key);
+          await stub.saveDoc(name, body, effectiveKey);
           await sendText(bot, chatId, `${cmd} updated.`, threadId);
         }
         return new Response("ok");
@@ -109,14 +121,14 @@ export default {
         if (!fact) {
           await sendText(bot, chatId, "Usage: /remember <something to remember>", threadId);
         } else {
-          await stub.appendDoc("memory", fact, key);
+          await stub.appendDoc("memory", fact, effectiveKey);
           await sendText(bot, chatId, `Got it — I'll remember:\n• ${fact}`, threadId);
         }
         return new Response("ok");
       }
 
       if (cmd === "/memory") {
-        const mem = (await stub.loadDoc("memory", key)).trim();
+        const mem = (await stub.loadDoc("memory", effectiveKey)).trim();
         await sendText(
           bot,
           chatId,
@@ -127,16 +139,51 @@ export default {
       }
 
       if (cmd === "/forget") {
-        await stub.clearDoc("memory", key);
+        await stub.clearDoc("memory", effectiveKey);
         await sendText(bot, chatId, "Cleared all saved memory.", threadId);
+        return new Response("ok");
+      }
+
+      if (cmd === "/agent") {
+        const parts = text.split(/\s+/);
+        const sub = parts[1] ?? "";
+        const name = parts[2] ?? "";
+        if (sub === "set") {
+          if (!name) {
+            await sendText(bot, chatId, "Usage: /agent set <name>", threadId);
+          } else if (!/^[a-z0-9_-]+$/i.test(name)) {
+            await sendText(bot, chatId, "Agent name must be letters, digits, hyphens or underscores.", threadId);
+          } else {
+            await stub.setAgentName(key, name);
+            await sendText(bot, chatId, `Agent set to "${name}". This thread now uses agent:${name} for all config.`, threadId);
+          }
+        } else if (sub === "unset") {
+          await stub.clearAgentName(key);
+          await sendText(bot, chatId, "Agent name removed — thread uses its own config again.", threadId);
+        } else if (sub === "list") {
+          const agents = await stub.listAgents();
+          if (agents.length === 0) {
+            await sendText(bot, chatId, "No named agents yet. Use /agent set <name> in a thread.", threadId);
+          } else {
+            const lines = agents.map((a) => `• ${a.name}  →  ${a.threadKey}`).join("\n");
+            await sendText(bot, chatId, `Named agents:\n${lines}`, threadId);
+          }
+        } else {
+          await sendText(
+            bot, chatId,
+            "/agent set <name> — assign named agent to this thread\n/agent unset — remove name\n/agent list — list all named agents",
+            threadId,
+          );
+        }
         return new Response("ok");
       }
 
       if (cmd === "/edit") {
         const workerUrl = new URL(request.url).origin;
-        const startParam = encodeSession(key);
+        const startParam = encodeSession(effectiveKey);
         const miniAppUrl = `${workerUrl}?startapp=${startParam}`;
-        await bot.api.sendMessage(chatId, "Open the editor to update soul, agents and memory:", {
+        const agentName = await stub.getAgentName(key);
+        await bot.api.sendMessage(chatId, `Open the editor${agentName ? ` for agent: ${agentName}` : ""}:`, {
           ...(threadId ? { message_thread_id: threadId } : {}),
           reply_markup: {
             inline_keyboard: [[{ text: "✏️ Open Editor", web_app: { url: miniAppUrl } }]],
@@ -156,7 +203,7 @@ export default {
         chatId,
         threadId,
         placeholderId: placeholder.message_id,
-        sessionKey: key,
+        sessionKey: effectiveKey,
         text,
         photoFileId: photo?.file_id,
         documentFileId: document?.file_id,
