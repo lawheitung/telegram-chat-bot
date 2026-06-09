@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import type { Env, ChatMessage } from "./types";
+import type { Env, ChatMessage, ModelTarget } from "./types";
 import { makeBot, downloadImageB64, downloadFileText, isTextMime, isImageMime, sendReply, buildSystem, MAX_TURNS } from "./bot";
 import { AREAS, DEFAULT_AREA, resolveTarget } from "./router";
 import { generate } from "./providers";
@@ -33,18 +33,58 @@ export class AgentDO extends DurableObject<Env> {
     return (await this.ctx.storage.get<ChatMessage[]>(`history:${key}`)) ?? [];
   }
 
+  // Extract key facts from a history chunk and append them to the memory doc.
+  // Uses Haiku for speed/cost. Returns the extracted text, or "" if nothing found.
+  private async extractAndSaveMemory(history: ChatMessage[], sessionKey: string): Promise<string> {
+    if (history.length === 0) return "";
+    const target: ModelTarget = { vendor: "anthropic", model: "claude-haiku-4-5-20251001", maxTokens: 1024 };
+    let extracted = "";
+    try {
+      extracted = await generate(
+        {
+          system: "You are a memory extraction assistant. Identify and preserve important facts.",
+          target,
+          history,
+          userText: "Extract key facts, user preferences, and decisions from this conversation for long-term memory. Use bullet points starting with '- '. If nothing is worth saving, reply with exactly: nothing",
+        },
+        this.env,
+      );
+    } catch (err) {
+      console.error("memory extraction failed", err);
+      return "";
+    }
+    if (!extracted.trim() || extracted.trim().toLowerCase() === "nothing") return "";
+    const current = (await this.loadDoc("memory", sessionKey)).trim();
+    const block = extracted.trim();
+    await this.saveDoc("memory", current ? `${current}\n\n${block}` : block, sessionKey);
+    return block;
+  }
+
   private async saveTurn(key: string, userText: string, assistantText: string): Promise<void> {
     const history = await this.getHistory(key);
     history.push(
       { role: "user", content: userText },
       { role: "assistant", content: assistantText },
     );
-    // Keep only the last MAX_TURNS exchanges (a user+assistant pair each).
+    // Auto-compact: before dropping old messages, silently extract facts from them.
+    if (history.length > MAX_TURNS * 2) {
+      const dropping = history.slice(0, history.length - MAX_TURNS * 2);
+      await this.extractAndSaveMemory(dropping, key);
+    }
     await this.ctx.storage.put(`history:${key}`, history.slice(-MAX_TURNS * 2));
   }
 
   async clearHistory(key: string): Promise<void> {
     await this.ctx.storage.delete(`history:${key}`);
+  }
+
+  // Manual compact: extract from full history, keep last 3 pairs for continuity.
+  async compact(sessionKey: string): Promise<string> {
+    const history = await this.getHistory(sessionKey);
+    if (history.length < 2) return "";
+    const extracted = await this.extractAndSaveMemory(history, sessionKey);
+    await this.ctx.storage.put(`history:${sessionKey}`, history.slice(-6));
+    return extracted;
   }
 
   // ----------------------------- area selection -----------------------------

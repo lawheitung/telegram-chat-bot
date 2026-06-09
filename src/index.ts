@@ -1,5 +1,5 @@
 import type { Env } from "./types";
-import { makeBot, sessionKey, sendPlaceholder, sendText } from "./bot";
+import { makeBot, sessionKey, sendPlaceholder, sendText, sendReply } from "./bot";
 import { AREAS, DEFAULT_AREA, areaList } from "./router";
 import { miniAppHtml, handleMiniAppApi, encodeSession } from "./miniapp";
 
@@ -10,6 +10,24 @@ export { AgentDO } from "./agent";
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
+
+    // ---- Setup: register webhook + sync commands (GET /setup?secret=...) ----
+    if (request.method === "GET" && url.pathname === "/setup") {
+      if (url.searchParams.get("secret") !== env.WEBHOOK_SECRET) {
+        return new Response("forbidden", { status: 403 });
+      }
+      const bot = makeBot(env.BOT_TOKEN);
+      const webhookUrl = `${url.origin}/`;
+      await bot.api.setWebhook(webhookUrl, {
+        secret_token: env.WEBHOOK_SECRET,
+        allowed_updates: ["message"],
+      });
+      await bot.api.setMyCommands(BOT_COMMANDS);
+      return new Response(
+        `✅ Setup complete\nWebhook: ${webhookUrl}\nCommands: ${BOT_COMMANDS.length} registered`,
+        { headers: { "Content-Type": "text/plain" } },
+      );
+    }
 
     // ---- Mini app: serve HTML and API ----
     if (request.method === "GET" && url.pathname === "/") {
@@ -144,6 +162,23 @@ export default {
         return new Response("ok");
       }
 
+      if (cmd === "/compact") {
+        const placeholder = await sendPlaceholder(bot, chatId, threadId);
+        ctx.waitUntil(
+          stub.compact(effectiveKey)
+            .then(async (extracted) => {
+              const msg = extracted
+                ? `✅ Compacted. Saved to memory:\n\n${extracted}`
+                : "Nothing to compact — history is short or contained no new facts.";
+              await sendReply(bot, chatId, placeholder.message_id, msg, threadId);
+            })
+            .catch(async (err) => {
+              await sendReply(bot, chatId, placeholder.message_id, `⚠️ Compact failed: ${(err as Error).message}`, threadId);
+            }),
+        );
+        return new Response("ok");
+      }
+
       if (cmd === "/agent") {
         const parts = text.split(/\s+/);
         const sub = parts[1] ?? "";
@@ -215,6 +250,18 @@ export default {
     return new Response("ok");
   },
 };
+
+const BOT_COMMANDS = [
+  { command: "help",    description: "Show available commands and current settings" },
+  { command: "model",   description: "View or set the model area for this thread" },
+  { command: "edit",    description: "Open the mini app editor (soul, agents, memory, tools…)" },
+  { command: "agent",   description: "Manage named agents: set <name> | unset | list" },
+  { command: "compact", description: "Extract key facts from history into memory, then clear history" },
+  { command: "reset",   description: "Clear this conversation's history" },
+  { command: "remember",description: "Save a fact to memory: /remember <fact>" },
+  { command: "memory",  description: "View saved memory for this thread" },
+  { command: "forget",  description: "Clear all saved memory for this thread" },
+];
 
 interface TgUpdate {
   update_id: number;
