@@ -189,7 +189,7 @@ export default {
           } else if (!/^[a-z0-9_-]+$/i.test(name)) {
             await sendText(bot, chatId, "Agent name must be letters, digits, hyphens or underscores.", threadId);
           } else {
-            await stub.setAgentName(key, name);
+            await stub.setAgentName(key, name, chatId, threadId);
             await sendText(bot, chatId, `Agent set to "${name}". This thread now uses agent:${name} for all config.`, threadId);
           }
         } else if (sub === "unset") {
@@ -200,8 +200,14 @@ export default {
           if (agents.length === 0) {
             await sendText(bot, chatId, "No named agents yet. Use /agent set <name> in a thread.", threadId);
           } else {
-            const lines = agents.map((a) => `• ${a.name}  →  ${a.threadKey}`).join("\n");
-            await sendText(bot, chatId, `Named agents:\n${lines}`, threadId);
+            const lines = await Promise.all(agents.map(async (a) => {
+              const area = (await stub.getArea(`agent:${a.name}`)) ?? "default";
+              const link = (a.chatId && a.threadId)
+                ? ` — t.me/c/${Math.abs(a.chatId)}/${a.threadId}`
+                : "";
+              return `• ${a.name} [${area}]${link}`;
+            }));
+            await sendText(bot, chatId, `Named agents:\n${lines.join("\n")}`, threadId);
           }
         } else {
           await sendText(

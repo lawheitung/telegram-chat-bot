@@ -132,8 +132,11 @@ export class AgentDO extends DurableObject<Env> {
   }
 
   // ----------------------------- named agents -----------------------------
-  async setAgentName(threadKey: string, name: string): Promise<void> {
+  async setAgentName(threadKey: string, name: string, chatId?: number, threadId?: number): Promise<void> {
     await this.ctx.storage.put(`agent:name:${threadKey}`, name);
+    if (chatId !== undefined) {
+      await this.ctx.storage.put(`agent:location:${name}`, `${chatId}:${threadId ?? ""}`);
+    }
   }
 
   async getAgentName(threadKey: string): Promise<string | null> {
@@ -141,14 +144,25 @@ export class AgentDO extends DurableObject<Env> {
   }
 
   async clearAgentName(threadKey: string): Promise<void> {
+    const name = await this.getAgentName(threadKey);
     await this.ctx.storage.delete(`agent:name:${threadKey}`);
+    if (name) await this.ctx.storage.delete(`agent:location:${name}`);
   }
 
-  async listAgents(): Promise<Array<{ name: string; threadKey: string }>> {
+  async getAgentLocation(name: string): Promise<{ chatId: number; threadId?: number } | null> {
+    const raw = await this.ctx.storage.get<string>(`agent:location:${name}`);
+    if (!raw) return null;
+    const [chatIdStr, threadIdStr] = raw.split(":");
+    return { chatId: Number(chatIdStr), threadId: threadIdStr ? Number(threadIdStr) : undefined };
+  }
+
+  async listAgents(): Promise<Array<{ name: string; threadKey: string; chatId?: number; threadId?: number }>> {
     const map = await this.ctx.storage.list<string>({ prefix: "agent:name:" });
-    const result: Array<{ name: string; threadKey: string }> = [];
+    const result: Array<{ name: string; threadKey: string; chatId?: number; threadId?: number }> = [];
     for (const [k, v] of map) {
-      result.push({ threadKey: k.slice("agent:name:".length), name: v });
+      const threadKey = k.slice("agent:name:".length);
+      const loc = await this.getAgentLocation(v);
+      result.push({ threadKey, name: v, chatId: loc?.chatId, threadId: loc?.threadId });
     }
     return result;
   }
