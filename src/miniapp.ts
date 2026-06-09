@@ -160,8 +160,8 @@ export function miniAppHtml(): string {
     font-size: 13px; font-weight: 500;
   }
   .tab.active {
-    background: var(--tg-theme-button-color, #2481cc);
-    color: var(--tg-theme-button-text-color, #fff);
+    background: #FE5F55;
+    color: #fff;
   }
   .panel { display: none; }
   .panel.active { display: flex; flex-direction: column; gap: 10px; }
@@ -179,8 +179,8 @@ export function miniAppHtml(): string {
   }
   button.save {
     padding: 11px; border-radius: 10px; border: none; cursor: pointer;
-    background: var(--tg-theme-button-color, #2481cc);
-    color: var(--tg-theme-button-text-color, #fff);
+    background: #FE5F55;
+    color: #fff;
     font-size: 15px; font-weight: 600;
   }
   button.save:disabled { opacity: 0.5; cursor: not-allowed; }
@@ -234,7 +234,7 @@ DOCS.forEach((d, i) => {
   panel.id = "panel-" + d.name;
   panel.className = "panel" + (i === 0 ? " active" : "");
   panel.innerHTML = \`
-    <p class="desc">\${d.desc} <span class="badge" style="\${d.scope==='global'?'background:#FE5F55;color:#fff;opacity:1':''}">\${d.scope}</span></p>
+    <p class="desc">\${d.desc} <span class="badge" style="\${d.scope==='global'?'background:#55FEC5;color:#000;opacity:1':''}">\${d.scope}</span></p>
     <textarea id="ta-\${d.name}" placeholder="Leave blank to disable…"></textarea>
     <button class="save" onclick="save('\${d.name}')">Save \${d.label}</button>
     <div class="status" id="st-\${d.name}"></div>
