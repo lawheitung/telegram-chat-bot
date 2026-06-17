@@ -146,12 +146,14 @@ export function miniAppHtml(): string {
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     background: var(--tg-theme-bg-color, #fff);
     color: var(--tg-theme-text-color, #000);
-    min-height: 100vh;
-    padding: 12px 16px 24px;
+    height: 100vh;
+    display: flex; flex-direction: column;
+    padding: 12px 16px 16px;
+    overflow: hidden;
   }
-  h1 { font-size: 17px; font-weight: 600; margin-bottom: 12px; }
+  h1 { font-size: 17px; font-weight: 600; margin-bottom: 12px; flex-shrink: 0; }
   .tabs {
-    display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px;
+    display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; flex-shrink: 0;
   }
   .tab {
     padding: 6px 12px; border-radius: 20px; border: none; cursor: pointer;
@@ -159,32 +161,30 @@ export function miniAppHtml(): string {
     color: var(--tg-theme-text-color, #000);
     font-size: 13px; font-weight: 500;
   }
-  .tab.active {
-    background: #FE5F55;
-    color: #fff;
-  }
+  .tab.active { background: #FE5F55; color: #fff; }
+  #panels { flex: 1; min-height: 0; display: flex; flex-direction: column; }
   .panel { display: none; }
-  .panel.active { display: flex; flex-direction: column; gap: 10px; }
-  .desc { font-size: 12px; opacity: 0.6; line-height: 1.4; }
+  .panel.active { display: flex; flex-direction: column; gap: 10px; flex: 1; min-height: 0; }
+  .desc { font-size: 12px; opacity: 0.6; line-height: 1.4; flex-shrink: 0; }
   .badge {
     display: inline-block; font-size: 10px; padding: 1px 6px; border-radius: 8px;
     background: var(--tg-theme-secondary-bg-color, #eee);
     opacity: 0.7; margin-left: 4px; vertical-align: middle;
   }
   textarea {
-    width: 100%; min-height: 180px; padding: 12px; border-radius: 10px; border: none;
+    flex: 1; min-height: 0;
+    width: 100%; padding: 12px; border-radius: 10px; border: none;
     background: var(--tg-theme-secondary-bg-color, #f0f0f0);
     color: var(--tg-theme-text-color, #000);
-    font-size: 14px; line-height: 1.5; resize: vertical; outline: none;
+    font-size: 14px; line-height: 1.5; resize: none; outline: none;
   }
   button.save {
     padding: 11px; border-radius: 10px; border: none; cursor: pointer;
-    background: #FE5F55;
-    color: #fff;
-    font-size: 15px; font-weight: 600;
+    background: #FE5F55; color: #fff;
+    font-size: 15px; font-weight: 600; flex-shrink: 0;
   }
   button.save:disabled { opacity: 0.5; cursor: not-allowed; }
-  .status { font-size: 13px; text-align: center; min-height: 18px; }
+  .status { font-size: 13px; text-align: center; min-height: 18px; flex-shrink: 0; }
   .status.ok { color: #FE5F55; }
   .status.err { color: #f44336; }
 </style>

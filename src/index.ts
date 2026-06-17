@@ -1,5 +1,5 @@
-import type { Env } from "./types";
-import { makeBot, sessionKey, sendPlaceholder, sendText, sendReply } from "./bot";
+import type { Env, EffortLevel } from "./types";
+import { makeBot, sessionKey, sendPlaceholder, sendText, sendReply, downloadFileText, isTextMime } from "./bot";
 import { AREAS, DEFAULT_AREA, areaList } from "./router";
 import { miniAppHtml, handleMiniAppApi, encodeSession } from "./miniapp";
 
@@ -80,17 +80,26 @@ export default {
 
       if (cmd === "/start" || cmd === "/help") {
         const current = (await stub.getArea(effectiveKey)) ?? DEFAULT_AREA;
+        const curLevel = await stub.getEffort(effectiveKey);
         const agentName = await stub.getAgentName(key);
         await sendText(
           bot,
           chatId,
-          `Hi! Each conversation uses model(s) based on its area.\n\n` +
-            (agentName ? `Agent: ${agentName}\n` : "") +
-            `Current area: ${current}\n\nSet it with /model <area>:\n${areaList()}\n\n` +
-            `Identity: /soul, /agents (view, or set by adding text).\n` +
-            `Memory: /remember <fact>, /memory (view), /forget (clear).\n` +
-            `/agent set <name> — assign a named agent to this thread.\n` +
-            `/reset clears this conversation's history.`,
+          `👋 **How this bot works**\n` +
+            `Each thread (Telegram topic) is its own agent — its own model, behavior, and memory. To set one up:\n\n` +
+            `**1. Start a thread & name it**\n` +
+            `In Telegram, create a new topic and give it a name (e.g. "journal") — that name is your agent. Claim it so the config survives deletion: \`/agent set journal\`. Also \`/agent list\`, \`/agent unset\`.\n\n` +
+            `**2. Pick a model + reasoning level**\n` +
+            `\`/model <name> [level]\` — e.g. \`/model opus high\`.\n${areaList(current)}\n\n` +
+            `**3. Give it behavior (its "skill")**\n` +
+            `\`/persona <text>\` — how this agent should act/think.  \`/soul <text>\` — identity shared by all agents.  \`/edit\` — visual editor (soul, persona, memory, tools…).\n\n` +
+            `**4. Memory**\n` +
+            `\`/remember <fact>\` · \`/memory\` (view) · \`/forget\` (clear) · \`/compact\` (fold history into memory).\n\n` +
+            `**5. Tools**\n` +
+            `\`/model admin\` — an executor that can actually call your Todoist + Housework tools.\n\n` +
+            `**6. Hand off between agents**\n` +
+            `\`/send <name>\` — send this thread's last reply to another named agent; the reply comes back here.\n\n` +
+            `Now: ${agentName ? `agent **${agentName}**, ` : ""}${current}${curLevel ? ` (${curLevel})` : ""}.  \`/reset\` clears this thread's history.`,
           threadId,
         );
         return new Response("ok");
@@ -103,17 +112,40 @@ export default {
       }
 
       if (cmd === "/model") {
-        const current = (await stub.getArea(effectiveKey)) ?? DEFAULT_AREA;
-        if (!arg || !AREAS[arg]) {
-          await sendText(bot, chatId, `Current area: ${current}\n\nChoose one:\n${areaList()}`, threadId);
+        const parts = text.split(/\s+/);
+        const name = parts[1];
+        const level = parts[2];
+        const curArea = (await stub.getArea(effectiveKey)) ?? DEFAULT_AREA;
+        if (!name || !AREAS[name]) {
+          const curLevel = await stub.getEffort(effectiveKey);
+          await sendText(
+            bot,
+            chatId,
+            `Current: ${curArea}${curLevel ? ` (${curLevel})` : ""}\n\nChoose one:\n${areaList(curArea)}`,
+            threadId,
+          );
+          return new Response("ok");
+        }
+        const area = AREAS[name];
+        if (level) {
+          if (!area.levels?.includes(level as EffortLevel)) {
+            const avail = area.levels ? area.levels.join("/") : "none";
+            await sendText(bot, chatId, `"${name}" doesn't support level "${level}". Available: ${avail}.`, threadId);
+            return new Response("ok");
+          }
+          await stub.setArea(effectiveKey, name);
+          await stub.setEffort(effectiveKey, level);
+          await sendText(bot, chatId, `Area set to ${name} (${level}) — ${area.label}.`, threadId);
         } else {
-          await stub.setArea(effectiveKey, arg);
-          await sendText(bot, chatId, `Area set to ${arg} — ${AREAS[arg].label}.`, threadId);
+          await stub.setArea(effectiveKey, name);
+          await stub.clearEffort(effectiveKey);
+          const def = area.defaultLevel ? ` (${area.defaultLevel})` : "";
+          await sendText(bot, chatId, `Area set to ${name}${def} — ${area.label}.`, threadId);
         }
         return new Response("ok");
       }
 
-      if (cmd === "/soul" || cmd === "/agents") {
+      if (cmd === "/soul" || cmd === "/persona") {
         const name = cmd === "/soul" ? "soul" : "agents";
         const body = text.slice(cmd.length).trim();
         if (!body) {
@@ -220,6 +252,106 @@ export default {
         return new Response("ok");
       }
 
+      // Action commands: run input through a fixed area once, reply here, leave the thread's model/history untouched.
+      const action = ACTIONS[cmd];
+      if (action) {
+        let input = text.slice(cmd.length).trim();
+        if (!input && action.fallbackLast) input = (await stub.getLastAssistantMessage(effectiveKey)) ?? "";
+        const hasImg = !!photo || !!(document?.mime_type?.startsWith("image/"));
+        if (!input && !hasImg) {
+          await sendText(bot, chatId, action.emptyMsg, threadId);
+          return new Response("ok");
+        }
+        const placeholder = await sendPlaceholder(bot, chatId, threadId);
+        ctx.waitUntil(
+          stub.handleMessage({
+            chatId,
+            threadId,
+            placeholderId: placeholder.message_id,
+            sessionKey: effectiveKey,
+            text: input,
+            photoFileId: photo?.file_id,
+            documentFileId: document?.file_id,
+            documentMimeType: document?.mime_type,
+            documentFileName: document?.file_name,
+            areaOverride: action.area,
+          }),
+        );
+        return new Response("ok");
+      }
+
+      if (cmd === "/send") {
+        if (!arg) {
+          await sendText(bot, chatId, "Usage: /send <agent-name>\n\nSends the last assistant message in this thread to the named agent. The reply comes back here.", threadId);
+          return new Response("ok");
+        }
+        if (!(await stub.agentExists(arg))) {
+          await sendText(bot, chatId, `No agent named "${arg}" found. Use /agent list to see available agents.`, threadId);
+          return new Response("ok");
+        }
+        const lastMsg = await stub.getLastAssistantMessage(effectiveKey);
+        if (!lastMsg) {
+          await sendText(bot, chatId, "Nothing to send — no assistant message in this thread yet.", threadId);
+          return new Response("ok");
+        }
+        const placeholder = await sendPlaceholder(bot, chatId, threadId);
+        ctx.waitUntil(
+          stub.handleMessage({
+            chatId,
+            threadId,
+            placeholderId: placeholder.message_id,
+            sessionKey: `agent:${arg}`,
+            text: lastMsg,
+          }),
+        );
+        return new Response("ok");
+      }
+
+      if (cmd === "/baseline") {
+        const placeholder = await sendPlaceholder(bot, chatId, threadId);
+        ctx.waitUntil(
+          (async () => {
+            try {
+              let content = "";
+              if (document?.file_id && document.mime_type && isTextMime(document.mime_type)) {
+                content = await downloadFileText(bot, env.BOT_TOKEN, document.file_id);
+              } else {
+                content = text.slice(cmd.length).trim();
+              }
+              if (!content) {
+                await sendReply(bot, chatId, placeholder.message_id, "Attach your health history as a .md/.txt with /baseline (or paste text after the command).", threadId);
+                return;
+              }
+              await stub.setHealthBaseline(effectiveKey, content);
+              await sendReply(bot, chatId, placeholder.message_id, `Baseline saved (${content.length} chars). I'll factor it into every consult here.`, threadId);
+            } catch (e) {
+              await sendReply(bot, chatId, placeholder.message_id, `⚠️ Baseline failed: ${(e as Error).message}`, threadId);
+            }
+          })(),
+        );
+        return new Response("ok");
+      }
+
+      if (cmd === "/checkin") {
+        const placeholder = await sendPlaceholder(bot, chatId, threadId);
+        ctx.waitUntil(
+          stub.healthCheckin(effectiveKey)
+            .then((msg) => sendReply(bot, chatId, placeholder.message_id, msg, threadId))
+            .catch((e) => sendReply(bot, chatId, placeholder.message_id, `⚠️ Check-in failed: ${(e as Error).message}`, threadId)),
+        );
+        return new Response("ok");
+      }
+
+      if (cmd === "/diagnosis") {
+        const placeholder = await sendPlaceholder(bot, chatId, threadId);
+        ctx.waitUntil(
+          stub.saveDiagnosis(effectiveKey)
+            .then((msg) => sendReply(bot, chatId, placeholder.message_id, msg, threadId))
+            .catch((e) => sendReply(bot, chatId, placeholder.message_id, `⚠️ Save failed: ${(e as Error).message}`, threadId)),
+        );
+        return new Response("ok");
+      }
+
       if (cmd === "/edit") {
         const workerUrl = new URL(request.url).origin;
         const startParam = encodeSession(effectiveKey);
@@ -258,11 +390,27 @@ export default {
   },
 };
 
+// One-shot action commands: <command> → run input through a fixed area, reply in-thread,
+// without changing the thread's model. Add a new action = one line here + one BOT_COMMANDS entry.
+const ACTIONS: Record<string, { area: string; fallbackLast?: boolean; emptyMsg: string }> = {
+  "/do": { area: "do", fallbackLast: true, emptyMsg: "Nothing to do — no plan or reply in this thread yet." },
+  "/log": { area: "log", fallbackLast: true, emptyMsg: "Nothing to log — send/produce posture scores or a plan first." },
+  "/plan": { area: "plan", fallbackLast: true, emptyMsg: "Nothing to plan - produce a weekly exercise list first." },
+};
+
 const BOT_COMMANDS = [
   { command: "help",    description: "Show available commands and current settings" },
-  { command: "model",   description: "View or set the model area for this thread" },
+  { command: "model",   description: "Set the model + reasoning level: /model <name> [level]" },
+  { command: "send",    description: "Hand off last reply to a named agent: /send <name>" },
+  { command: "do",      description: "Execute to Todoist: /do [instruction] (or applies the last plan)" },
+  { command: "log",     description: "Log posture scores to GitHub (after a posture analysis)" },
+  { command: "plan",    description: "Save the week's exercise/workout plan to GitHub" },
+  { command: "baseline", description: "Set your health baseline (attach health_history.md)" },
+  { command: "checkin",  description: "Log a quick health/cycle check-in (trend + summary)" },
+  { command: "diagnosis",description: "Save the full consultation note (archive)" },
   { command: "edit",    description: "Open the mini app editor (soul, agents, memory, tools…)" },
   { command: "agent",   description: "Manage named agents: set <name> | unset | list" },
+  { command: "persona", description: "View/set this thread's behavior (how it acts/thinks)" },
   { command: "compact", description: "Extract key facts from history into memory, then clear history" },
   { command: "reset",   description: "Clear this conversation's history" },
   { command: "remember",description: "Save a fact to memory: /remember <fact>" },
