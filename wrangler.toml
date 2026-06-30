@@ -31,6 +31,13 @@ entrypoint = "HouseworkRpc"
 [ai]
 binding = "AI"
 
+# D1: grocery/food catalog the meal agent queries via search_food.
+# Fill database_name + database_id from `wrangler d1 list` (or the dashboard).
+[[d1_databases]]
+binding = "FOODDB"
+database_name = "fairprice"
+database_id = "ea340366-9799-45ab-9fe8-bccef0f81870"
+
 # Durable Object: the stateful agent. SQLite-backed (required + free on the Free plan).
 [[durable_objects.bindings]]
 name = "AGENT"

@@ -48,6 +48,7 @@ export interface Env {
 
     // Bindings
     AI: Ai; // Workers AI (free models, no key)
+    FOODDB: D1Database; // grocery/food catalog queried by the meal agent
     AGENT: DurableObjectNamespace<import("./agent").AgentDO>;
     TODOIST: TodoistRpc; // Todoist service binding — RPC, same isolate
     HOUSEWORK: HouseworkRpc; // Housework tracker service binding — RPC, same isolate

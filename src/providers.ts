@@ -2,6 +2,7 @@ import type { Env, GenerateInput } from "./types";
 import { TODOIST_TOOLS, callTodoistTool } from "./mcp";
 import { HOUSEWORK_TOOLS, callHouseworkTool } from "./housework";
 import { POSTURE_TOOLS, WORKOUT_TOOLS, callGithubTool } from "./github";
+import { FOOD_TOOLS, callFoodTool } from "./food";
 
 type VendorKind = "anthropic" | "google" | "openai" | "workers-ai";
 
@@ -67,6 +68,9 @@ interface ClaudeMessage {
 }
 
 async function callAnthropic(input: GenerateInput, env: Env): Promise<string> {
+  // Tool areas (e.g. the meal agent) run the Anthropic tool_use loop instead.
+  if (input.target.tools?.length) return callAnthropicWithTools(input, env);
+
   const messages: ClaudeMessage[] = input.history.map((m) => ({ role: m.role, content: m.content }));
   if (input.image) {
     messages.push({
@@ -285,7 +289,74 @@ const TOOL_BUNDLES: Record<
   housework: { defs: HOUSEWORK_TOOLS, run: (n, a, env) => callHouseworkTool(n, a, env.HOUSEWORK) },
   posture: { defs: POSTURE_TOOLS, run: (n, a, env) => callGithubTool(n, a, env) },
   workout: { defs: WORKOUT_TOOLS, run: (n, a, env) => callGithubTool(n, a, env) },
+  food: { defs: FOOD_TOOLS, run: (n, a, env) => callFoodTool(n, a, env) },
 };
+
+// Anthropic tool_use loop — the reliable, capable counterpart to the Workers AI loop.
+// Used by tool areas on Claude (e.g. the meal agent on Haiku). Send tools; while the reply
+// has tool_use blocks, run them and feed back tool_result, looping until it returns text.
+async function callAnthropicWithTools(input: GenerateInput, env: Env): Promise<string> {
+  const bundles = (input.target.tools ?? []).map((n) => TOOL_BUNDLES[n]).filter(Boolean);
+  const tools = bundles
+    .flatMap((b) => b.defs)
+    .map((t) => ({ name: t.name, description: t.description, input_schema: t.input_schema }));
+
+  const messages: Array<Record<string, unknown>> = [
+    ...input.history.map((m) => ({ role: m.role, content: m.content })),
+    { role: "user", content: input.userText || "(no text)" },
+  ];
+  const effort = input.target.effort;
+
+  for (let step = 0; step < MAX_TOOL_STEPS; step++) {
+    const body: Record<string, unknown> = {
+      model: input.target.model,
+      max_tokens: input.target.maxTokens,
+      system: [{ type: "text", text: input.system, cache_control: { type: "ephemeral" } }],
+      messages,
+      tools,
+    };
+    if (effort && effort !== "low") body.thinking = { type: "adaptive" };
+    if (effort) body.output_config = { effort };
+
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`Claude ${res.status}: ${await res.text()}`);
+    const data = (await res.json()) as { content?: Array<Record<string, unknown>> };
+    const content = data.content ?? [];
+    const toolUses = content.filter((b) => b.type === "tool_use");
+    console.log(`[mealtool] step=${step} called=[${toolUses.map((t) => t.name).join(",")}]`);
+
+    if (toolUses.length === 0) {
+      return (
+        content
+          .filter((b) => b.type === "text")
+          .map((b) => (b.text as string) ?? "")
+          .join("")
+          .trim() || "(no response)"
+      );
+    }
+
+    messages.push({ role: "assistant", content });
+    const results = [];
+    for (const tu of toolUses) {
+      const bundle = bundles.find((b) => b.defs.some((d) => d.name === tu.name));
+      const out = bundle
+        ? await bundle.run(tu.name as string, (tu.input ?? {}) as Record<string, unknown>, env)
+        : `Unknown tool: ${tu.name}`;
+      console.log(`[mealtool] ${tu.name}(${JSON.stringify(tu.input ?? {}).slice(0, 150)}) -> ${String(out).slice(0, 150)}`);
+      results.push({ type: "tool_result", tool_use_id: tu.id, content: out });
+    }
+    messages.push({ role: "user", content: results });
+  }
+  return "⚠️ Stopped after too many tool steps — please narrow the request.";
+}
 
 interface NormToolCall {
   id: string;

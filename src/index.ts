@@ -1,6 +1,6 @@
 import type { Env, EffortLevel } from "./types";
 import { makeBot, sessionKey, sendPlaceholder, sendText, sendReply, downloadFileText, isTextMime } from "./bot";
-import { AREAS, DEFAULT_AREA, areaList } from "./router";
+import { MODELS, DEFAULT_MODEL, modelList, TEMPLATES, TOOL_BUNDLE_NAMES } from "./router";
 import { miniAppHtml, handleMiniAppApi, encodeSession } from "./miniapp";
 
 // The Durable Object class must be exported from the entry module so the runtime
@@ -79,7 +79,7 @@ export default {
       const [cmd, arg] = text.split(/\s+/, 2);
 
       if (cmd === "/start" || cmd === "/help") {
-        const current = (await stub.getArea(effectiveKey)) ?? DEFAULT_AREA;
+        const current = (await stub.getModel(effectiveKey)) ?? DEFAULT_MODEL;
         const curLevel = await stub.getEffort(effectiveKey);
         const agentName = await stub.getAgentName(key);
         await sendText(
@@ -90,13 +90,14 @@ export default {
             `**1. Start a thread & name it**\n` +
             `In Telegram, create a new topic and give it a name (e.g. "journal") — that name is your agent. Claim it so the config survives deletion: \`/agent set journal\`. Also \`/agent list\`, \`/agent unset\`.\n\n` +
             `**2. Pick a model + reasoning level**\n` +
-            `\`/model <name> [level]\` — e.g. \`/model opus high\`.\n${areaList(current)}\n\n` +
+            `\`/model <name> [level]\` — e.g. \`/model opus high\`. Swap anytime.\n${modelList(current)}\n\n` +
             `**3. Give it behavior (its "skill")**\n` +
             `\`/persona <text>\` — how this agent should act/think.  \`/soul <text>\` — identity shared by all agents.  \`/edit\` — visual editor (soul, persona, memory, tools…).\n\n` +
             `**4. Memory**\n` +
             `\`/remember <fact>\` · \`/memory\` (view) · \`/forget\` (clear) · \`/compact\` (fold history into memory).\n\n` +
             `**5. Tools**\n` +
-            `\`/model admin\` — an executor that can actually call your Todoist + Housework tools.\n\n` +
+            `\`/tools add <name>\` / \`/tools remove <name>\` / \`/tools\` (list). Bundles: ${TOOL_BUNDLE_NAMES.join(", ")}. (Tools run on Claude or Kimi, not GPT/Gemini.)\n\n` +
+            `**Or apply a ready-made agent:** \`/agent use <health|meal|admin>\` — sets persona, model, and tools in one go.\n\n` +
             `**6. Hand off between agents**\n` +
             `\`/send <name>\` — send this thread's last reply to another named agent; the reply comes back here.\n\n` +
             `Now: ${agentName ? `agent **${agentName}**, ` : ""}${current}${curLevel ? ` (${curLevel})` : ""}.  \`/reset\` clears this thread's history.`,
@@ -115,32 +116,60 @@ export default {
         const parts = text.split(/\s+/);
         const name = parts[1];
         const level = parts[2];
-        const curArea = (await stub.getArea(effectiveKey)) ?? DEFAULT_AREA;
-        if (!name || !AREAS[name]) {
+        const curModel = (await stub.getModel(effectiveKey)) ?? DEFAULT_MODEL;
+        if (!name || !MODELS[name]) {
           const curLevel = await stub.getEffort(effectiveKey);
           await sendText(
             bot,
             chatId,
-            `Current: ${curArea}${curLevel ? ` (${curLevel})` : ""}\n\nChoose one:\n${areaList(curArea)}`,
+            `Current model: ${curModel}${curLevel ? ` (${curLevel})` : ""}\n\n${modelList(curModel)}`,
             threadId,
           );
           return new Response("ok");
         }
-        const area = AREAS[name];
+        const m = MODELS[name];
         if (level) {
-          if (!area.levels?.includes(level as EffortLevel)) {
-            const avail = area.levels ? area.levels.join("/") : "none";
+          if (!m.levels?.includes(level as EffortLevel)) {
+            const avail = m.levels ? m.levels.join("/") : "none (this model has no reasoning levels)";
             await sendText(bot, chatId, `"${name}" doesn't support level "${level}". Available: ${avail}.`, threadId);
             return new Response("ok");
           }
-          await stub.setArea(effectiveKey, name);
+          await stub.setModel(effectiveKey, name);
           await stub.setEffort(effectiveKey, level);
-          await sendText(bot, chatId, `Area set to ${name} (${level}) — ${area.label}.`, threadId);
+          await sendText(bot, chatId, `Model set to ${name} (${level}) — ${m.label}. Persona, tools, and memory unchanged.`, threadId);
         } else {
-          await stub.setArea(effectiveKey, name);
+          await stub.setModel(effectiveKey, name);
           await stub.clearEffort(effectiveKey);
-          const def = area.defaultLevel ? ` (${area.defaultLevel})` : "";
-          await sendText(bot, chatId, `Area set to ${name}${def} — ${area.label}.`, threadId);
+          const def = m.defaultLevel ? ` (${m.defaultLevel})` : "";
+          await sendText(bot, chatId, `Model set to ${name}${def} — ${m.label}. Persona, tools, and memory unchanged.`, threadId);
+        }
+        return new Response("ok");
+      }
+
+      if (cmd === "/tools") {
+        const parts = text.split(/\s+/);
+        const sub = (parts[1] ?? "").toLowerCase();
+        const bundle = parts[2];
+        const cur = await stub.getTools(effectiveKey);
+        const modelId = (await stub.getModel(effectiveKey)) ?? DEFAULT_MODEL;
+        const supportsTools = !!MODELS[modelId]?.supportsTools;
+        if (sub === "add" || sub === "remove") {
+          if (!bundle || !TOOL_BUNDLE_NAMES.includes(bundle)) {
+            await sendText(bot, chatId, `Unknown tool "${bundle ?? ""}". Available: ${TOOL_BUNDLE_NAMES.join(", ")}.`, threadId);
+            return new Response("ok");
+          }
+          const next = sub === "add" ? [...new Set([...cur, bundle])] : cur.filter((t) => t !== bundle);
+          await stub.setTools(effectiveKey, next);
+          const warn = next.length && !supportsTools ? `\n⚠️ Current model (${modelId}) can't run tools — switch to a Claude model or kimi (/model haiku).` : "";
+          await sendText(bot, chatId, `Tools: ${next.length ? next.join(", ") : "none"}.${warn}`, threadId);
+        } else {
+          const warn = cur.length && !supportsTools ? `\n⚠️ Current model (${modelId}) can't run tools.` : "";
+          await sendText(
+            bot,
+            chatId,
+            `Attached tools: ${cur.length ? cur.join(", ") : "none"}.${warn}\n\nAvailable: ${TOOL_BUNDLE_NAMES.join(", ")}\nUse: /tools add <name> · /tools remove <name>`,
+            threadId,
+          );
         }
         return new Response("ok");
       }
@@ -227,25 +256,32 @@ export default {
         } else if (sub === "unset") {
           await stub.clearAgentName(key);
           await sendText(bot, chatId, "Agent name removed — thread uses its own config again.", threadId);
+        } else if (sub === "use") {
+          if (!name) {
+            await sendText(bot, chatId, `Usage: /agent use <name>. Options: ${Object.keys(TEMPLATES).join(", ")}.`, threadId);
+          } else {
+            const msg = await stub.applyTemplate(effectiveKey, name);
+            await sendText(bot, chatId, msg, threadId);
+          }
         } else if (sub === "list") {
           const agents = await stub.listAgents();
           if (agents.length === 0) {
             await sendText(bot, chatId, "No named agents yet. Use /agent set <name> in a thread.", threadId);
           } else {
             const lines = await Promise.all(agents.map(async (a) => {
-              const area = (await stub.getArea(`agent:${a.name}`)) ?? "default";
+              const model = (await stub.getModel(`agent:${a.name}`)) ?? "default";
               const tgId = String(Math.abs(a.chatId ?? 0)).replace(/^100/, "");
               const link = (a.chatId && a.threadId)
                 ? ` — t.me/c/${tgId}/${a.threadId}`
                 : "";
-              return `• ${a.name} [${area}]${link}`;
+              return `• ${a.name} [${model}]${link}`;
             }));
             await sendText(bot, chatId, `Named agents:\n${lines.join("\n")}`, threadId);
           }
         } else {
           await sendText(
             bot, chatId,
-            "/agent set <name> — assign named agent to this thread\n/agent unset — remove name\n/agent list — list all named agents",
+            "/agent set <name> — name this thread\n/agent use <health|meal|admin> — apply a ready-made agent (persona+model+tools)\n/agent unset — remove name\n/agent list — list named agents",
             threadId,
           );
         }
@@ -400,7 +436,8 @@ const ACTIONS: Record<string, { area: string; fallbackLast?: boolean; emptyMsg: 
 
 const BOT_COMMANDS = [
   { command: "help",    description: "Show available commands and current settings" },
-  { command: "model",   description: "Set the model + reasoning level: /model <name> [level]" },
+  { command: "model",   description: "Set this thread's model (brain): /model <name> [level]" },
+  { command: "tools",   description: "Attach/detach tools: /tools [add|remove <name>]" },
   { command: "send",    description: "Hand off last reply to a named agent: /send <name>" },
   { command: "do",      description: "Execute to Todoist: /do [instruction] (or applies the last plan)" },
   { command: "log",     description: "Log posture scores to GitHub (after a posture analysis)" },
@@ -409,7 +446,7 @@ const BOT_COMMANDS = [
   { command: "checkin",  description: "Log a quick health/cycle check-in (trend + summary)" },
   { command: "diagnosis",description: "Save the full consultation note (archive)" },
   { command: "edit",    description: "Open the mini app editor (soul, agents, memory, tools…)" },
-  { command: "agent",   description: "Manage named agents: set <name> | unset | list" },
+  { command: "agent",   description: "Name a thread / apply an agent: set | use <health|meal|admin> | list" },
   { command: "persona", description: "View/set this thread's behavior (how it acts/thinks)" },
   { command: "compact", description: "Extract key facts from history into memory, then clear history" },
   { command: "reset",   description: "Clear this conversation's history" },

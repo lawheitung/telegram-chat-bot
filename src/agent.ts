@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env, ChatMessage, ModelTarget } from "./types";
 import { makeBot, downloadImageB64, downloadFileText, isTextMime, isImageMime, sendReply, buildSystem, MAX_TURNS } from "./bot";
-import { AREAS, DEFAULT_AREA, resolveTarget } from "./router";
+import { MODELS, DEFAULT_MODEL, EXECUTORS, TEMPLATES, BASE_SYSTEM, VISION_FALLBACK } from "./router";
 import { generate } from "./providers";
 
 // Everything the agent needs to handle one message. Plain data — sent over RPC.
@@ -88,13 +88,38 @@ export class AgentDO extends DurableObject<Env> {
     return extracted;
   }
 
-  // ----------------------------- area selection -----------------------------
-  async getArea(key: string): Promise<string | null> {
-    return (await this.ctx.storage.get<string>(`area:${key}`)) ?? null;
+  // ----------------------------- per-thread model + tools + inject -----------------------------
+  // A thread = an agent (persona + memory). The model (brain) and tools (capabilities) are
+  // independent, switchable per-thread settings.
+  async getModel(key: string): Promise<string | null> {
+    return (await this.ctx.storage.get<string>(`model:${key}`)) ?? null;
+  }
+  async setModel(key: string, model: string): Promise<void> {
+    await this.ctx.storage.put(`model:${key}`, model);
   }
 
-  async setArea(key: string, area: string): Promise<void> {
-    await this.ctx.storage.put(`area:${key}`, area);
+  async getTools(key: string): Promise<string[]> {
+    return (await this.ctx.storage.get<string[]>(`tools:${key}`)) ?? [];
+  }
+  async setTools(key: string, tools: string[]): Promise<void> {
+    await this.ctx.storage.put(`tools:${key}`, tools);
+  }
+
+  async getInject(key: string): Promise<string | null> {
+    return (await this.ctx.storage.get<string>(`inject:${key}`)) ?? null;
+  }
+
+  // Seed a thread into a kind of agent: persona doc + starting model + tools + inject.
+  async applyTemplate(key: string, templateId: string): Promise<string> {
+    const t = TEMPLATES[templateId];
+    if (!t) return `Unknown agent template: ${templateId}. Options: ${Object.keys(TEMPLATES).join(", ")}.`;
+    await this.saveDoc("agents", t.persona, key);
+    await this.setModel(key, t.model);
+    await this.setTools(key, t.tools);
+    if (t.inject) await this.ctx.storage.put(`inject:${key}`, t.inject);
+    else await this.ctx.storage.delete(`inject:${key}`);
+    const tools = t.tools.length ? t.tools.join(", ") : "none";
+    return `This thread is now the “${t.label}” agent — model ${t.model}, tools: ${tools}. Persona set. Swap the brain anytime with /model.`;
   }
 
   // Per-thread reasoning level (overrides the area's defaultLevel). Stored
@@ -292,11 +317,7 @@ export class AgentDO extends DurableObject<Env> {
     const env = this.env;
     const bot = makeBot(env.BOT_TOKEN);
     try {
-      // Pick the area: explicit selection wins; any image (photo or image document) -> "image".
       const hasImage = !!p.photoFileId || !!(p.documentFileId && p.documentMimeType && isImageMime(p.documentMimeType));
-      let areaId = p.areaOverride ?? (await this.getArea(p.sessionKey)) ?? (hasImage ? "gemini" : DEFAULT_AREA);
-      if (!AREAS[areaId]) areaId = DEFAULT_AREA;
-      const area = AREAS[areaId];
 
       const photoImage = p.photoFileId
         ? await downloadImageB64(bot, env.BOT_TOKEN, p.photoFileId)
@@ -327,24 +348,35 @@ export class AgentDO extends DurableObject<Env> {
 
       const image = photoImage ?? docImage;
 
-      // Build the thread's system prompt + history.
-      const history = area.stateless ? [] : await this.getHistory(p.sessionKey);
-      let system = area.system;
-      if (!area.stateless) {
-        const [soul, user, tools, agents, memory, heartbeat, local_tools] = await Promise.all([
-          this.loadDoc("soul"),
-          this.loadDoc("user"),
-          this.loadDoc("tools"),
-          this.loadDoc("agents", p.sessionKey),
-          this.loadDoc("memory", p.sessionKey),
-          this.loadDoc("heartbeat", p.sessionKey),
-          this.loadDoc("local_tools", p.sessionKey),
-        ]);
-        system = buildSystem(area.system, { soul, user, agents, tools, memory, heartbeat, local_tools });
+      // Action-command backends (/do /log /plan): stateless executors, fixed model + tools.
+      if (p.areaOverride && EXECUTORS[p.areaOverride]) {
+        const ex = EXECUTORS[p.areaOverride];
+        const exReply = await generate(
+          { system: ex.system, target: { vendor: ex.vendor, model: ex.model, maxTokens: ex.maxTokens, tools: ex.tools }, history: [], userText },
+          env,
+        );
+        await sendReply(bot, p.chatId, p.placeholderId, exReply, p.threadId);
+        return; // stateless — nothing saved
       }
 
-      // Health thread: inject baseline + summary + most-recent consultation (all from DO, fast).
-      if (area.injectHealth) {
+      // Conversational thread = an agent: persona (docs) + a per-thread model + per-thread tools.
+      const modelId = (await this.getModel(p.sessionKey)) ?? DEFAULT_MODEL;
+      const m = MODELS[modelId] ?? MODELS[DEFAULT_MODEL];
+
+      const history = await this.getHistory(p.sessionKey);
+      const [soul, user, tools, agents, memory, heartbeat, local_tools] = await Promise.all([
+        this.loadDoc("soul"),
+        this.loadDoc("user"),
+        this.loadDoc("tools"),
+        this.loadDoc("agents", p.sessionKey),
+        this.loadDoc("memory", p.sessionKey),
+        this.loadDoc("heartbeat", p.sessionKey),
+        this.loadDoc("local_tools", p.sessionKey),
+      ]);
+      let system = buildSystem(BASE_SYSTEM, { soul, user, agents, tools, memory, heartbeat, local_tools });
+
+      // Memory injection (set by the health template via /agent use health).
+      if ((await this.getInject(p.sessionKey)) === "health") {
         const [baseline, summary, latestDx] = await Promise.all([
           this.getHealthBaseline(p.sessionKey),
           this.getHealthSummary(p.sessionKey),
@@ -357,11 +389,21 @@ export class AgentDO extends DurableObject<Env> {
         if (add.length) system = `${system}\n\n${add.join("\n\n")}`;
       }
 
-      // TESTING: image goes to the thread's OWN model (Claude/etc.) to compare vs Gemini.
-      // The thread's model gets the image directly via resolveTarget(area, hasImage) + generate({image}).
-      const base = resolveTarget(area, !!image);
-      const level = (await this.getEffort(p.sessionKey)) ?? area.defaultLevel;
-      const target = level ? { ...base, effort: level as ModelTarget["effort"] } : base;
+      // Target = brain + attached tools + reasoning level. If the brain can't see images,
+      // route this turn to the vision fallback (Gemini) instead.
+      let target: ModelTarget;
+      if (image && !m.vision) {
+        target = { ...VISION_FALLBACK };
+      } else {
+        target = { vendor: m.vendor, model: m.model, maxTokens: m.maxTokens };
+        const attached = await this.getTools(p.sessionKey);
+        if (attached.length && m.supportsTools) target.tools = attached;
+        if (m.levels) {
+          const level = (await this.getEffort(p.sessionKey)) ?? m.defaultLevel;
+          if (level) target.effort = level as ModelTarget["effort"];
+        }
+      }
+
       const reply = await generate({ system, target, history, userText, image }, env);
 
       // --- Gemini-eyes pipeline (disabled for now; flip back by restoring this branch) ---
@@ -387,7 +429,7 @@ export class AgentDO extends DurableObject<Env> {
       // }
 
       await sendReply(bot, p.chatId, p.placeholderId, reply, p.threadId);
-      if (!area.stateless) await this.saveTurn(p.sessionKey, historyLabel, reply);
+      await this.saveTurn(p.sessionKey, historyLabel, reply);
     } catch (err) {
       console.error("agent handleMessage failed", err);
       await sendReply(

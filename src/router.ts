@@ -1,176 +1,148 @@
 import type { ModelTarget, EffortLevel } from "./types";
 
-export interface AreaConfig {
+// ============================================================================
+// The new model: a THREAD is an agent (persona + memory). On top of it you pick
+// a MODEL (brain) with /model and attach TOOLS with /tools — both per-thread,
+// switchable anytime. TEMPLATES seed a thread into a kind of agent; EXECUTORS are
+// the stateless backends for the /do /log /plan action commands.
+// ============================================================================
+
+// ----------------------------- MODELS (brains) -----------------------------
+export interface ModelDef {
   id: string;
   label: string;
-  system: string;
-  text: ModelTarget; // used for text turns
-  image?: ModelTarget; // override when an image is attached
-  levels?: EffortLevel[]; // selectable reasoning levels for this area (omit = none)
-  defaultLevel?: EffortLevel; // level used when the user hasn't picked one
-  hidden?: boolean; // omit from the /model menu (internal executor areas)
-  stateless?: boolean; // skip history + docs + memory; treat each call as one-shot
-  injectHealth?: boolean; // prepend the DO health baseline + summary + latest consult
+  vendor: string;
+  model: string;
+  maxTokens: number;
+  levels?: EffortLevel[]; // selectable reasoning levels (omit = none)
+  defaultLevel?: EffortLevel;
+  supportsTools?: boolean; // can run a tool loop (Anthropic + Workers AI only)
+  vision?: boolean; // can read images directly
 }
 
-// Shared system prompt for the tool-executor areas (admin chat + /do backend).
+export const MODELS: Record<string, ModelDef> = {
+  kimi: { id: "kimi", label: "Kimi 2.6 (Workers AI, free)", vendor: "workersai", model: "@cf/moonshotai/kimi-k2.6", maxTokens: 8192, supportsTools: true },
+  haiku: { id: "haiku", label: "Claude Haiku 4.5 (cheap, tools)", vendor: "anthropic", model: "claude-haiku-4-5", maxTokens: 4096, supportsTools: true, vision: true },
+  sonnet: { id: "sonnet", label: "Claude Sonnet 4.6", vendor: "anthropic", model: "claude-sonnet-4-6", maxTokens: 4096, levels: ["low", "medium", "high", "max"], defaultLevel: "low", supportsTools: true, vision: true },
+  opus: { id: "opus", label: "Claude Opus 4.8", vendor: "anthropic", model: "claude-opus-4-8", maxTokens: 12000, levels: ["low", "medium", "high", "xhigh", "max"], defaultLevel: "high", supportsTools: true, vision: true },
+  gemini: { id: "gemini", label: "Gemini 3.5 Flash", vendor: "gemini", model: "gemini-3.5-flash", maxTokens: 4096, levels: ["low", "medium", "high"], defaultLevel: "medium", vision: true },
+  gpt: { id: "gpt", label: "GPT-5.5 (OpenAI)", vendor: "openai", model: "gpt-5.5", maxTokens: 4096, vision: true },
+  "gpt-mini": { id: "gpt-mini", label: "GPT-5.4-mini (OpenAI, cheap)", vendor: "openai", model: "gpt-5.4-mini", maxTokens: 4096, vision: true },
+};
+
+export const DEFAULT_MODEL = "kimi";
+
+// When the chosen model can't see images (Kimi), route that turn here instead.
+export const VISION_FALLBACK: ModelTarget = { vendor: "gemini", model: "gemini-3.5-flash", maxTokens: 4096 };
+
+// Base persona when a thread hasn't set its own (the persona doc layers on top).
+export const BASE_SYSTEM = "You are a helpful personal assistant.";
+
+// ----------------------------- TOOL BUNDLES (attachable) -----------------------------
+// Names map to bundles in providers.ts. Attach/detach per thread with /tools.
+// NOTE: tools only run on models with supportsTools (Claude + Workers AI).
+export const TOOL_BUNDLE_NAMES = ["todoist", "housework", "posture", "workout", "food"];
+
+// Shared executor persona (admin chat + /do backend).
 const EXECUTOR_SYSTEM = [
-  "You are the user's personal admin executor with access to Todoist (tasks) and Housework (chores) tools. Carry out the user's request by calling the tools, then reply with a short confirmation of what you did.",
-  "",
-  "IMPORTANT: To answer ANY question about tasks or chores, you MUST call the tools first (get_tasks / list_chores). Never answer from memory and never say you can't access — always call the tool.",
-  "",
-  "Data model — the user uses Todoist's hierarchy as projects:",
-  "- Top-level tasks (no parent_id) act as PROJECTS, e.g. 'Create telegram assistant bot'.",
-  "- Subtasks (with a parent_id) are the STEPS inside a project.",
-  "- A standalone top-level task is just a simple task, e.g. 'Mop the floor'.",
-  "",
-  "Rules:",
-  "- To add a step to a project: first get_tasks to find the parent task's id, then add_task with that parent_id.",
-  "- Never guess task ids — look them up with get_tasks first.",
-  "- Use complete_task to check things off (not delete_task).",
-  "- Priority: 1=normal, 2=medium, 3=high, 4=urgent. Due dates take natural language ('tomorrow', 'every weekday 9am').",
-  "- Keep replies brief.",
+  "You are the user's personal admin executor with access to Todoist (tasks) and Housework (chores) tools. Carry out the request by calling the tools, then reply with a short confirmation.",
+  "IMPORTANT: To answer ANY question about tasks or chores you MUST call the tools first (get_tasks / list_chores). Never answer from memory or say you can't access — always call the tool.",
+  "Data model: top-level Todoist tasks (no parent_id) act as PROJECTS; subtasks (with parent_id) are the steps. To add a step, get_tasks to find the parent id, then add_task with that parent_id. Never guess ids. Use complete_task to check off (not delete). Priority 1-4; due dates take natural language. Keep replies brief.",
 ].join("\n");
 
-// Each area maps a kind of work to model(s). Assign one per Telegram topic with
-// /model <id>. `text` handles normal turns; `image` (optional) overrides when a
-// photo is attached.
-//
-// SWAPPING MODELS: change a `model` string (same vendor), or point a target at a
-// different vendor from VENDORS in providers.ts. No other code changes.
-export const AREAS: Record<string, AreaConfig> = {
-  sonnet: {
-    id: "sonnet",
-    label: "Claude Sonnet",
-    system: "You are a helpful personal assistant.",
-    text: { vendor: "anthropic", model: "claude-sonnet-4-6", maxTokens: 4096 },
-    levels: ["low", "medium", "high", "max"],
-    defaultLevel: "low",
-  },
-  opus: {
-    id: "opus",
-    label: "Claude Opus",
-    system: "Reason carefully and rigorously, then give a clear, well-structured answer.",
-    text: { vendor: "anthropic", model: "claude-opus-4-8", maxTokens: 12000 },
-    levels: ["low", "medium", "high", "xhigh", "max"],
-    defaultLevel: "high",
-  },
-  gemini: {
-    id: "gemini",
-    label: "Gemini",
-    system: "You are a helpful assistant.",
-    text: { vendor: "gemini", model: "gemini-3.5-flash", maxTokens: 4096 },
-    image: { vendor: "gemini", model: "gemini-3.5-flash", maxTokens: 4096 },
-    levels: ["low", "medium", "high"],
-    defaultLevel: "medium",
-  },
-  gpt: {
-    id: "gpt",
-    label: "ChatGPT 5.5 (OpenAI flagship)",
-    system: "You are a helpful assistant.",
-    text: { vendor: "openai", model: "gpt-5.5", maxTokens: 4096 },
-    image: { vendor: "openai", model: "gpt-5.5", maxTokens: 4096 },
-  },
-  "gpt-mini": {
-    id: "gpt-mini",
-    label: "ChatGPT 5.4-mini (OpenAI, cheap)",
-    system: "You are a helpful assistant.",
-    text: { vendor: "openai", model: "gpt-5.4-mini", maxTokens: 4096 },
-    image: { vendor: "openai", model: "gpt-5.4-mini", maxTokens: 4096 },
-  },
+// ----------------------------- TEMPLATES (agents) -----------------------------
+// Seed a thread into a kind of agent: writes the persona doc + sets a starting model
+// + attaches tools (+ optional memory injection). Apply with /agent use <id>.
+// Afterwards, swap the model and tools freely.
+export interface TemplateDef {
+  id: string;
+  label: string;
+  persona: string;
+  model: string;
+  tools: string[];
+  inject?: "health";
+}
+
+export const TEMPLATES: Record<string, TemplateDef> = {
   health: {
     id: "health",
-    label: "Health · TCM · Cycle (Sonnet)",
-    system: [
+    label: "Health · TCM · Cycle",
+    model: "sonnet",
+    tools: [],
+    inject: "health",
+    persona: [
       "You are the user's personal Traditional Chinese Medicine practitioner, nutritionist, and cycle-sync expert, in an ongoing relationship — you understand HER body over time, not one-off answers.",
-      "You may be given her health baseline, a running summary (standing patterns + recent trend), and her most recent full consultation. Always reason from these and reference recurring patterns rather than treating each message in isolation.",
-      "If no baseline is present yet, run a PROGRESSIVE intake interview: ask a few key questions at a time (TCM 'Ten Questions' style — sleep, digestion, temperature, appetite/thirst, energy, menstruation, emotions, pain), deepening over several exchanges rather than one long form. Mention she can upload her health history with /baseline.",
-      "Interpret symptoms through a TCM lens (qi/blood, yin/yang, warming/cooling, organ systems) and map to her cycle phase. When she shares a tongue / face / hair photo, read it as part of the diagnosis.",
-      "Give practical nutrition / food-therapy guidance for her current phase + symptoms, plus lifestyle notes. Be conversational: ask a sharpening follow-up rather than dumping generic advice.",
-      "Recording: /checkin saves a quick structured trend entry; /diagnosis archives your full consultation note. When she logs, make sure your latest message clearly states cycle day, phase, flow, energy/mood, tongue, symptoms, your TCM pattern, and nutrition focus.",
-      "TCM and nutrition are complementary, not a substitute for medical care. For severe, persistent, or red-flag symptoms, recommend seeing a doctor/gynaecologist.",
+      "You may be given her health baseline, a running summary (standing patterns + recent trend), and her most recent full consultation. Always reason from these and reference recurring patterns.",
+      "If no baseline is present yet, run a PROGRESSIVE intake interview (TCM 'Ten Questions' style — sleep, digestion, temperature, appetite/thirst, energy, menstruation, emotions, pain), deepening over several exchanges. Mention she can upload her health history with /baseline.",
+      "Interpret symptoms through a TCM lens (qi/blood, yin/yang, warming/cooling, organ systems) and map to her cycle phase. Read tongue/face/hair photos as part of the diagnosis.",
+      "Give practical nutrition / food-therapy guidance for her current phase + symptoms, plus lifestyle notes. Be conversational; ask a sharpening follow-up rather than dumping generic advice.",
+      "Recording: /checkin saves a quick structured trend entry; /diagnosis archives your full consultation note.",
+      "TCM and nutrition are complementary, not a substitute for medical care. For severe or red-flag symptoms, recommend seeing a doctor/gynaecologist.",
     ].join("\n"),
-    // Sonnet: careful health calibration + the large stable prompt caches well. Vision for tongue/food photos.
-    text: { vendor: "anthropic", model: "claude-sonnet-4-6", maxTokens: 4096 },
-    image: { vendor: "anthropic", model: "claude-sonnet-4-6", maxTokens: 4096 },
-    levels: ["low", "medium", "high", "max"],
-    defaultLevel: "medium",
-    injectHealth: true,
   },
-  kimi: {
-    id: "kimi",
-    label: "Kimi 2.6 (Workers AI, free)",
-    system: "You are a concise, helpful assistant.",
-    text: { vendor: "workersai", model: "@cf/moonshotai/kimi-k2.6", maxTokens: 8192 },
-    // Kimi on the Workers AI binding is text-only here, so route photos to Gemini.
-    image: { vendor: "gemini", model: "gemini-3.5-flash", maxTokens: 2048 },
+  meal: {
+    id: "meal",
+    label: "Meal planner (food DB)",
+    model: "haiku",
+    tools: ["food"],
+    persona: [
+      "You are the user's meal-planning assistant. You compose meals and grocery picks from products she can ACTUALLY buy, using the search_food tool over her grocery catalog (name, brand, pack, price, macros, nutrigrade, stock).",
+      "Use search_food to find real products — it returns the top 5 matches. If results are ambiguous or too broad, ASK her to clarify (price range, pack size, brand, dietary constraint) rather than guessing.",
+      "Compose practical meals with real prices and rough macros; prefer in-stock items and note the cost. Query again as needed to round out a meal. Be conversational and concise.",
+    ].join("\n"),
   },
   admin: {
     id: "admin",
     label: "Admin (Todoist + Housework)",
-    system: EXECUTOR_SYSTEM,
-    // Foreground admin chat on Nemotron — tool-calls reliably thanks to the global
-    // "detailed thinking off" injection in callWorkersAIWithTools (model-name based).
-    text: { vendor: "workersai", model: "@cf/nvidia/nemotron-3-120b-a12b", maxTokens: 8192, tools: ["todoist", "housework"] },
-  },
-  // Hidden backend executor for /do — applies a plan via tools, stateless, no chat.
-  // Nemotron: needs "detailed thinking off" (injected in providers.ts) to emit tool calls —
-  // in thinking-on mode it reasons instead of calling. MoE → cheap; tuned for agentic tool use.
-  do: {
-    id: "do",
-    label: "Executor (backend, /do)",
-    system: EXECUTOR_SYSTEM,
-    text: { vendor: "workersai", model: "@cf/nvidia/nemotron-3-120b-a12b", maxTokens: 8192, tools: ["todoist", "housework"] },
-    hidden: true,
-    stateless: true,
-  },
-  // Hidden stateless executor for /log: posture/workout notes to GitHub. GitHub tools ONLY,
-  // so it can't mis-route to Todoist. Its own prompt maps scores to log_posture, exercises to add_weekly_plan.
-  log: {
-    id: "log",
-    label: "Posture log (GitHub)",
-    system: [
-      "You log posture assessments to the user's notes via the log_posture tool, then reply with a short confirmation.",
-      "Map the five region scores (cranio-cervical, shoulder girdle, thoracolumbar, pelvic/hip, lower extremity) to log_posture; each region is /20 and the total is computed. Also pass a short 'diagnosis' (key findings) and 'top_focus' (the single thing to work on) if present.",
-      "Call log_posture EXACTLY ONCE, then confirm briefly - do NOT call it again.",
-    ].join("\n"),
-    text: { vendor: "workersai", model: "@cf/nvidia/nemotron-3-120b-a12b", maxTokens: 8192, tools: ["posture"] },
-    hidden: true,
-    stateless: true,
-  },
-  // /plan: weekly exercise/workout suggestions (add_weekly_plan only).
-  plan: {
-    id: "plan",
-    label: "Weekly plan (GitHub)",
-    system: [
-      "You save the week's exercise/workout suggestions to the user's notes via the add_weekly_plan tool, then reply with a short confirmation.",
-      "Pass the week's focus (one line) and the list of exercises to add_weekly_plan.",
-      "Call add_weekly_plan EXACTLY ONCE, then confirm briefly - do NOT call it again.",
-    ].join("\n"),
-    text: { vendor: "workersai", model: "@cf/nvidia/nemotron-3-120b-a12b", maxTokens: 8192, tools: ["workout"] },
-    hidden: true,
-    stateless: true,
+    model: "kimi",
+    tools: ["todoist", "housework"],
+    persona: EXECUTOR_SYSTEM,
   },
 };
 
-export const DEFAULT_AREA = "kimi";
-
-export function resolveTarget(area: AreaConfig, hasImage: boolean): ModelTarget {
-  return hasImage && area.image ? area.image : area.text;
+// ----------------------------- EXECUTORS (action-command backends) -----------------------------
+// Stateless backends for /do /log /plan. Fixed model + tools + system. Not user-pickable.
+export interface ExecutorDef {
+  system: string;
+  vendor: string;
+  model: string;
+  maxTokens: number;
+  tools: string[];
 }
 
-// Renders the selectable areas as a model menu, with reasoning levels in brackets.
-// Pass the current area id to mark it.
-export function areaList(current?: string): string {
-  const lines = Object.values(AREAS).filter((a) => !a.hidden).map((a) => {
-    const here = a.id === current ? "✓ " : "";
-    const levels = a.levels ? `  [${a.levels.join("/")}]` : "";
-    const note = a.id === "admin" ? "  · Todoist + Housework" : "";
-    return `${here}${a.id} — ${a.text.model}${levels}${note}`;
+const NEMOTRON = "@cf/nvidia/nemotron-3-120b-a12b";
+
+export const EXECUTORS: Record<string, ExecutorDef> = {
+  do: { system: EXECUTOR_SYSTEM, vendor: "workersai", model: NEMOTRON, maxTokens: 8192, tools: ["todoist", "housework"] },
+  log: {
+    system: [
+      "You log posture assessments via the log_posture tool, then reply with a short confirmation.",
+      "Map the five region scores (cranio-cervical, shoulder girdle, thoracolumbar, pelvic/hip, lower extremity) to log_posture; each is /20 and the total is computed. Also pass a short 'diagnosis' and 'top_focus' if present.",
+      "Call log_posture EXACTLY ONCE, then confirm briefly - do NOT call it again.",
+    ].join("\n"),
+    vendor: "workersai", model: NEMOTRON, maxTokens: 8192, tools: ["posture"],
+  },
+  plan: {
+    system: [
+      "You save the week's exercise/workout suggestions via the add_weekly_plan tool, then reply with a short confirmation.",
+      "Pass the week's focus (one line) and the list of exercises to add_weekly_plan.",
+      "Call add_weekly_plan EXACTLY ONCE, then confirm briefly - do NOT call it again.",
+    ].join("\n"),
+    vendor: "workersai", model: NEMOTRON, maxTokens: 8192, tools: ["workout"],
+  },
+};
+
+// ----------------------------- menus -----------------------------
+export function modelList(current?: string): string {
+  const lines = Object.values(MODELS).map((m) => {
+    const here = m.id === current ? "✓ " : "";
+    const lv = m.levels ? `  [${m.levels.join("/")}]` : "";
+    const tools = m.supportsTools ? "" : "  · no tools";
+    return `${here}${m.id} — ${m.label}${lv}${tools}`;
   });
   return (
     lines.join("\n") +
-    "\n\nLevels: low = no thinking (fast) · medium/high/max = deeper reasoning, slower." +
-    "\nSet with /model <name> [level] — e.g. /model opus high"
+    "\n\nSet the brain with /model <name> [level] (e.g. /model opus high)." +
+    "\nAttach capabilities with /tools. Become a specialised agent with /agent use <health|meal|admin>."
   );
 }
