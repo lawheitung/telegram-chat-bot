@@ -3,3 +3,4 @@ node_modules/
 .wrangler/
 dist/
 *.log.DS_Store
+.DS_Store
