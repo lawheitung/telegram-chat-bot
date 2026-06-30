@@ -594,3 +594,102 @@ Images: no command — an attached photo goes to the **thread's own model** (§1
 - **Everything this session is deployed but UNCOMMITTED to git** (branch `claude/file-reading`).
 - Prior gaps still open: `/do` idempotency (dup tasks on re-run), destructive-op confirmation, no
   tests/evals, heartbeat/cron not built, skill library deferred.
+
+---
+---
+
+# PART III — Session 3 (decouple model/tools/persona; D1 meal agent; Anthropic tool loop)
+
+Supersedes the **"area" model** wherever Parts I/II describe it. The old fused `AREAS` concept is gone.
+
+## 29. The decoupling — a thread IS the agent (supersedes §5, §6, §26)
+
+The fused "area" (model + persona + tools + memory in one bundle, picked via `/model`) confused the
+user: specialised agents (`health`, `meal`, `admin`) showed up in the **model** menu. Root cause:
+tools + injection could *only* live on an area, so anything needing them had to be an area, and all
+areas surfaced under `/model`.
+
+**Fix — split "area" into independent, per-thread, in-chat-switchable knobs:**
+- **`/model <name>`** → the BRAIN only. `MODELS` registry (router.ts): `kimi` (default, free),
+  `haiku`, `sonnet`, `opus`, `gemini`, `gpt`, `gpt-mini`. Stored `model:{key}`.
+- **`/tools [add|remove <name>]`** → CAPABILITIES, per-thread (`tools:{key}`). Bundles: todoist,
+  housework, posture, workout, food.
+- **`/persona`** → behavior (the per-thread `agents` doc).
+- **`/agent use <health|meal|admin>`** → apply a **TEMPLATE** (writes persona + sets model + tools +
+  inject in one shot). `/agent set <name>` still names the thread (storage identity).
+
+`router.ts` now exposes three registries instead of `AREAS`:
+- **`MODELS`** — brains (each: vendor, model, maxTokens, levels?, `supportsTools`, `vision`).
+- **`TEMPLATES`** — health/meal/admin (persona + model + tools + optional `inject`). Replaced the areas.
+- **`EXECUTORS`** — do/log/plan stateless backends for the action commands.
+
+`handleMessage`: `areaOverride` (/do /log /plan) → `EXECUTORS[override]` (stateless). Otherwise
+conversational: `model = getModel(key) ?? kimi`; system from `BASE_SYSTEM` + docs; inject health memory
+if `inject:{key}==="health"`; target = brain + `getTools(key)` (only if model `supportsTools`) + level;
+**image + non-vision brain → `VISION_FALLBACK` (Gemini)** for that turn.
+
+Mental model now matches reality: **model = brain · tools = capabilities · persona = behavior ·
+thread = the agent (identity + memory).**
+
+## 30. The Anthropic tool loop (and the "tiering" lesson)
+
+Built `callAnthropicWithTools` — the Claude `tool_use` counterpart to `callWorkersAIWithTools`. Gate:
+`callAnthropic` routes to it when `target.tools?.length`. Loop: send `tools`; while the reply has
+`tool_use` blocks, run them, append `tool_result`, repeat; else return text. Caching on system,
+`MAX_TOOL_STEPS` cap.
+
+**The lesson that motivated it:** "smart model **plans**, cheap model **executes**" (Opus → Nemotron)
+underperformed — *tool orchestration is itself a reasoning task* (which tool, extract args, when to
+stop), and the free Workers AI models flub it (the `detailed thinking off` saga, over-calling,
+tool-scoping gymnastics). The split was a **cost** choice, not a quality one; mainstream agents use
+**one capable model + tools**. So for judgment-heavy work, give the *smart* model the tools.
+
+**BUT cost still won where the user wanted it:** they chose to keep `/do`/`/log`/`/plan` on **free
+Nemotron**, and put only the **meal agent** on a paid-but-reliable Claude model.
+
+**Constraint:** tools only run on models with a tool loop — **Claude (Haiku/Sonnet/Opus) + Workers AI
+(Kimi/Nemotron)**. GPT/Gemini have NO loop, so attaching tools there does nothing (`/tools` warns).
+
+## 31. The meal agent + D1 (verified)
+
+- **D1 binding `FOODDB`** → DB `fairprice` (`ea340366-…`), table **`products`** — a 4,357-row
+  FairPrice grocery catalog (name, brand, pack_raw, price, in_stock, nutrigrade, macros, url…).
+- **`search_food`** (`src/food.ts`) — read-only SQL, **top 5**, `CAST(... AS REAL)` on numeric filters
+  (columns are scraped as text). Bundle `food`.
+- **`meal` template** = `haiku` + `food`. Conversational; persona: search → clarify-if-ambiguous →
+  compose from real products.
+- **D1 access is native** (just `env.FOODDB`) — unlike Todoist/Housework, no separate Worker. 4,357
+  rows is too many to inject → query, don't inject.
+- **Haiku is enough**: it's a reliable tool-caller (the unreliability was the *free* models), and the
+  *facts come from D1* so the model only composes. Model-agnostic loop → swap to Sonnet via one string.
+- **Verified** via `wrangler tail`: Haiku called `search_food`, D1 returned rows, loop stopped cleanly.
+
+## 32. Migration note (one-time)
+
+Because model/tools became per-thread settings (and old threads have none set), existing threads
+**reset to `kimi` + no tools** after this refactor. Re-apply on each: `/agent use meal | health |
+admin`. Old `area:{key}` storage entries are dead leftovers (harmless).
+
+## 33. Command reference (current — supersedes §27)
+
+| Command | What |
+|---|---|
+| `/model <name> [level]` | set this thread's **brain** (kimi/haiku/sonnet/opus/gemini/gpt/gpt-mini) |
+| `/tools [add\|remove <name>]` | attach/detach **capabilities** (todoist, housework, posture, workout, food) |
+| `/persona` | this thread's behavior doc |
+| `/agent set <name>` · `use <health\|meal\|admin>` · `list` | name a thread / apply a template / list |
+| `/soul` · `/remember` `/memory` `/forget` `/compact` | global identity / memory ops |
+| `/do` · `/log` · `/plan` | stateless Nemotron executors (Todoist / posture-GitHub / workout-GitHub) |
+| `/baseline` · `/checkin` · `/diagnosis` | health thread (DO-backed) |
+| `/send <name>` · `/edit` · `/reset` · `/start` | handoff / mini-app / clear / help |
+
+## 34. Open gaps (supersedes §28)
+
+- **Migration pending** (§32): re-apply agent templates on existing threads; sync menu via `/setup`.
+- **Parts I/II reference the old area model** — Part III is the source of truth for model/tools/persona.
+- **Debug logs still in:** `[mealtool]` (callAnthropicWithTools), `[cache]` (callAnthropic).
+- **Dead code:** github.ts cycle path (`CYCLE_TOOLS`/`getRecentCycleLog`/`log_cycle`/`get_cycle`).
+- **Deferred:** cross-thread `read_thread` tool (meal agent ← health context, "pass 2"); nightly
+  DO→GitHub export; `/summary` DO viewer; OpenAI/Gemini tool loops.
+- **Resolved since §28:** `OPENAI_API_KEY` set; git push working (osxkeychain PAT); all work committed
+  + pushed to `origin/claude/file-reading` (latest `cb16305`).
